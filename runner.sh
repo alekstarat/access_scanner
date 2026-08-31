@@ -13,4 +13,6 @@ WORKER_PID=$!
 
 trap 'kill "$DISCOVERY_PID" "$WORKER_PID" 2>/dev/null || true' INT TERM EXIT
 
+tmux new-session "less +F logs/discovery.log" \; split-window -h "less +F logs/worker.log"
+
 wait "$WORKER_PID"

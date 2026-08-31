@@ -3,6 +3,15 @@ import importlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
+HTTP_PORTS = {
+    80, 3000, 5000, 8000, 8008,
+    8080, 8081, 8088, 8888, 9000,
+}
+
+HTTPS_PORTS = {
+    443, 4443, 8443, 9443,
+}
+
 def parse_ports(ports):
     """
     Преобразует:
@@ -12,6 +21,8 @@ def parse_ports(ports):
         [(22, "tcp"), (80, "tcp"), (443, "tcp")]
     """
     result = set()
+
+    if len(ports) >= 10: raise Exception("[Possible honeypot]\nskipping...")
 
     for item in ports:
         try:
@@ -42,10 +53,15 @@ def run_module(ip, port, proto):
     try:
         module = importlib.import_module(module_name)
     except ModuleNotFoundError:
-        return (
-            f"[{ip}:{port}/{proto}] "
-            f"no scanner ({module_name})"
-        )
+        if port not in HTTP_PORTS and port not in HTTPS_PORTS:
+            return (
+                f"[{ip}:{port}/{proto}] "
+                f"no scanner ({module_name})"
+            )
+        elif port in HTTP_PORTS:
+            module = importlib.import_module("scanners.port_80")
+        elif port in HTTPS_PORTS:
+            module = importlib.import_module("scanners.port_443")
 
     if not hasattr(module, "run"):
         return (
