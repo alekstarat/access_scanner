@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Access Scanner</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
+</head>
+<body>
+<header class="topbar">
+    <div class="brand">
+        <span class="brand-mark">A</span>
+        <div>
+            <strong>Access Scanner</strong>
+            <small>recon intelligence</small>
+        </div>
+    </div>
+    <form class="search" method="get" action="/">
+        <input name="q" value="{{ query }}" placeholder="IP, domain, service, banner…">
+        <button type="submit">Search</button>
+    </form>
+</header>
+
+<div class="layout">
+    <aside class="sidebar">
+        <div class="sidebar-head">Hosts</div>
+        <div class="sidebar-list">
+            {% for h in nav_hosts %}
+            <a class="sidebar-item" href="{{ url_for('host_detail', host_id=h.id) }}">
+                <span class="mono">{{ h.ip }}</span>
+                <span class="sidebar-risk {{ h.risk_score|risk_class }}">{{ h.risk_score }}</span>
+            </a>
+            {% else %}
+            <div class="empty-sm">No hosts</div>
+            {% endfor %}
+        </div>
+    </aside>
+
+    <main class="container with-sidebar">
+        <section class="hero">
+            <div>
+                <div class="eyebrow">HOST INVENTORY</div>
+                <h1>Recon overview</h1>
+                <p>Hosts, services, domains, findings and deep-chain results.</p>
+            </div>
+            <div class="stats">
+                <div class="stat"><b>{{ stats.hosts }}</b><span>hosts</span></div>
+                <div class="stat"><b>{{ stats.services }}</b><span>observations</span></div>
+                <div class="stat"><b>{{ stats.findings }}</b><span>findings</span></div>
+                <div class="stat danger"><b>{{ stats.critical }}</b><span>critical</span></div>
+            </div>
+        </section>
+
+        <section class="panel filters-panel">
+            <form class="filters" method="get" action="/">
+                <input type="hidden" name="q" value="{{ query }}">
+                <label>
+                    <span>Service</span>
+                    <select name="service">
+                        <option value="">All services</option>
+                        {% for s in services %}
+                        <option value="{{ s }}" {% if service == s %}selected{% endif %}>{{ s }}</option>
+                        {% endfor %}
+                    </select>
+                </label>
+                <label>
+                    <span>Risk</span>
+                    <select name="risk">
+                        <option value="">All risk</option>
+                        {% for r in ['low','medium','high','critical'] %}
+                        <option value="{{ r }}" {% if risk == r %}selected{% endif %}>{{ r }}</option>
+                        {% endfor %}
+                    </select>
+                </label>
+                <label>
+                    <span>Country</span>
+                    <select name="country">
+                        <option value="">All countries</option>
+                        {% for c in countries %}
+                        <option value="{{ c }}" {% if country == c %}selected{% endif %}>{{ c }}</option>
+                        {% endfor %}
+                    </select>
+                </label>
+                <label>
+                    <span>Domain</span>
+                    <select name="has_domain">
+                        <option value="">Any</option>
+                        <option value="1" {% if has_domain == '1' %}selected{% endif %}>Has domain</option>
+                        <option value="0" {% if has_domain == '0' %}selected{% endif %}>No domain</option>
+                    </select>
+                </label>
+                <div class="filter-actions">
+                    <button type="submit">Apply</button>
+                    <a class="back" href="/">Reset</a>
+                </div>
+            </form>
+        </section>
+
+        <section class="panel">
+            <div class="panel-head">
+                <h2>Hosts</h2>
+                <span>{{ hosts|length }} shown</span>
+            </div>
+
+            <div class="host-list">
+                {% for host in hosts %}
+                <a class="host-row" href="{{ url_for('host_detail', host_id=host.id) }}">
+                    <div class="host-main">
+                        <div class="host-ip">{{ host.ip }}</div>
+                        <div class="host-meta">
+                            {% if host.domains_preview %}
+                            <span class="domain-preview">{{ host.domains_preview }}{% if host.domain_count > 3 %} +{{ host.domain_count - 3 }}{% endif %}</span>
+                            ·
+                            {% endif %}
+                            {% if host.city or host.country %}
+                            {{ host.city or '' }}{% if host.city and host.country %}, {% endif %}{{ host.country or '' }}
+                            ·
+                            {% endif %}
+                            last {{ host.last_seen|short_time }}
+                            · {{ host.service_count }} svc
+                            · {{ host.finding_count }} find
+                        </div>
+                    </div>
+                    <div class="host-risk {{ host.risk_score|risk_class }}">
+                        <strong>{{ host.risk_score }}</strong>
+                        <span>/100</span>
+                    </div>
+                    <div class="arrow">→</div>
+                </a>
+                {% else %}
+                <div class="empty">No hosts found.</div>
+                {% endfor %}
+            </div>
+        </section>
+    </main>
+</div>
+</body>
+</html>

@@ -5,6 +5,8 @@ set -euo pipefail
 touch active_hosts.txt
 mkdir -p state logs
 
+python3 database.py
+
 ./genip.sh >> logs/discovery.log 2>&1 &
 DISCOVERY_PID=$!
 

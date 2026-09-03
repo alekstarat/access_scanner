@@ -1,19 +1,57 @@
 import socket
+from .common import result, finding
 
 
 def run(ip, port, proto):
     if proto != "tcp":
-        return "unsupported protocol"
+        return result(
+            service="ftp",
+            port=port,
+            protocol=proto,
+            findings=[
+                finding("unsupported_protocol", 0, "FTP module expects TCP")
+            ],
+        )
 
     try:
         with socket.create_connection((ip, port), timeout=3) as sock:
             sock.settimeout(3)
             banner = sock.recv(512).decode(errors="replace").strip()
 
-        if not banner:
-            return "FTP open, no banner"
+        observations = {}
+        findings = []
 
-        return f"FTP: {banner}"
+        if banner:
+            observations["banner"] = banner
+            observations["version"] = banner
+        else:
+            findings.append(
+                finding(
+                    "ftp_no_banner",
+                    1,
+                    "FTP port open but no banner received",
+                )
+            )
+
+        return result(
+            service="ftp",
+            port=port,
+            protocol=proto,
+            observations=observations,
+            findings=findings,
+        )
 
     except Exception as exc:
-        return f"FTP error: {exc}"
+        return result(
+            service="ftp",
+            port=port,
+            protocol=proto,
+            findings=[
+                finding(
+                    "ftp_error",
+                    0,
+                    "FTP probe failed",
+                    evidence=str(exc),
+                )
+            ],
+        )

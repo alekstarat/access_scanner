@@ -1,163 +1,479 @@
-#!/usr/bin/env python3
-"""
-Worker: читает active_hosts.txt в режиме append-only.
-
-Discovery (genip.sh) только дописывает строки.
-Worker хранит byte-offset в state/worker.offset и подхватывает
-только новые данные. Если новых строк нет — ждёт, не завершаясь.
-"""
-
-import fcntl
+import argparse
+import concurrent.futures
+import json
 import os
-import re
-import subprocess
 import time
 from pathlib import Path
+import ipaddress
 
-QUEUE = Path("active_hosts.txt")
-OFFSET_FILE = Path("state/worker.offset")
-POLL_INTERVAL = 1.0  # секунды между проверками, когда новых данных нет
-
-# Строка вида: "1.2.3.4 - Ports: 22/tcp,80/tcp,443/tcp"
-LINE_RE = re.compile(
-    r"^(\d{1,3}(?:\.\d{1,3}){3})\s*-\s*Ports:\s*(.+)$",
-    re.IGNORECASE,
+from main import run_module, format_result
+from database import (
+    init_db,
+    connect,
+    get_or_create_host,
+    create_scan,
+    finish_scan,
+    upsert_observation,
+    upsert_domain,
+    upsert_geo,
+    upsert_finding,
+    enqueue_deep,
+    fetch_pending_deep,
+    mark_deep_running,
+    mark_deep_done,
+    save_deep_result,
+    utcnow,
 )
+from risk_engine import update_host_score, risk_level
+from intelligence.geo import lookup as geo_lookup
+from intelligence.dns import reverse_dns
+from intelligence.tls_info import probe as tls_probe
+from chains.registry import get_chains_for_service, run_chain
+from chains.ssh import ssh
+
+
+QUEUE_FILE = Path("active_hosts.txt")
+OFFSET_FILE = Path("state/worker.offset")
+POLL_INTERVAL = 1.0
+
+# Сколько deep-задач можно выполнять параллельно
+DEEP_WORKERS = 4
+# Максимальное время на одну deep-задачу (секунды)
+DEEP_TIMEOUT = 300
+
+_executor = concurrent.futures.ThreadPoolExecutor(max_workers=DEEP_WORKERS)
+
+
+def log(message: str):
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}", flush=True)
+
+
+def valid_ip(value: str) -> bool:
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        return False
 
 
 def load_offset() -> int:
-    """Читает сохранённый byte-offset. При ошибке/отсутствии — 0."""
     try:
-        text = OFFSET_FILE.read_text(encoding="utf-8").strip()
-        if not text:
-            return 0
-        return max(0, int(text))
-    except (OSError, ValueError):
+        return int(OFFSET_FILE.read_text().strip())
+    except (FileNotFoundError, ValueError):
         return 0
 
 
-def save_offset(offset: int) -> None:
-    """Атомарно записывает byte-offset."""
+def save_offset(offset: int):
     OFFSET_FILE.parent.mkdir(parents=True, exist_ok=True)
     tmp = OFFSET_FILE.with_suffix(".tmp")
-    tmp.write_text(str(offset) + "\n", encoding="utf-8")
+    tmp.write_text(str(offset))
     os.replace(tmp, OFFSET_FILE)
 
 
-def read_new_chunk(offset: int) -> tuple[bytes, int]:
+def parse_line(line: str):
     """
-    Читает байты начиная с offset до текущего конца файла.
-    Возвращает (data, file_size_at_read).
-    Файл открывается только на чтение — discovery может спокойно append'ить.
+    Формат: IP 22/tcp 80/tcp 443/tcp
     """
-    if not QUEUE.exists():
-        return b"", offset
+    parts = line.replace(",", " ").strip().split()
+    if not parts:
+        return None
 
-    with open(QUEUE, "rb") as f:
-        fcntl.flock(f, fcntl.LOCK_SH)
+    ip = parts[0]
+    if not valid_ip(ip):
+        return None
+
+    ports = []
+    for item in parts[1:]:
+        if "/" not in item:
+            continue
         try:
-            f.seek(0, os.SEEK_END)
-            size = f.tell()
+            port_s, proto = item.lower().split("/", 1)
+            port = int(port_s)
+            if not 1 <= port <= 65535:
+                continue
+            if proto not in ("tcp", "udp"):
+                continue
+            ports.append((port, proto))
+        except ValueError:
+            continue
 
-            if offset > size:
-                # файл обрезали / пересоздали — начинаем с начала
-                offset = 0
-
-            if offset >= size:
-                return b"", size
-
-            f.seek(offset)
-            data = f.read()
-        finally:
-            fcntl.flock(f, fcntl.LOCK_UN)
-
-    return data, offset + len(data)
-
-
-def parse_line(line: str) -> tuple[str, list[str]] | None:
-    """
-    Парсит строку discovery.
-    Возвращает (ip, ["22/tcp", "80/tcp", ...]) или None.
-    """
-    line = line.strip()
-    if not line or line.startswith("=") or line.startswith("Started"):
-        return None
-
-    m = LINE_RE.match(line)
-    if not m:
-        return None
-
-    ip = m.group(1)
-    ports_raw = m.group(2)
-    ports = [p.strip() for p in ports_raw.split(",") if p.strip()]
     if not ports:
         return None
-    return ip, ports
+
+    return ip, sorted(set(ports))
 
 
-def process(ip: str, ports: list[str]) -> None:
-    """Вызывает main.py (port-hub) для IP и списка портов."""
-    print(f"[*] Processing {ip}  ports={ports}", flush=True)
+# ── Network enrichment (no DB lock held) ───────────────
 
-    cmd = ["python3", "main.py", ip, *ports]
+def fetch_ptr(ip: str) -> str | None:
     try:
-        result = subprocess.run(
-            cmd,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-        if result.stdout:
-            print(result.stdout.rstrip(), flush=True)
-        if result.stderr:
-            print(result.stderr.rstrip(), flush=True)
-        if result.returncode != 0:
-            print(f"[!] {ip}: exit code {result.returncode}", flush=True)
-    except subprocess.TimeoutExpired:
-        print(f"[!] {ip}: timeout", flush=True)
+        return reverse_dns(ip)
+    except Exception:
+        return None
+
+
+def fetch_geo(ip: str) -> dict | None:
+    try:
+        return geo_lookup(ip)
+    except Exception:
+        return None
+
+
+def fetch_tls(ip: str, port: int) -> tuple[dict, list]:
+    """Returns (tls_info, extra_findings)."""
+    try:
+        info = tls_probe(ip, port)
     except Exception as exc:
-        print(f"[!] {ip}: {exc}", flush=True)
+        return {"ok": False, "error": str(exc), "domains": [], "cert": {}}, []
+
+    cert = info.get("cert") or {}
+    findings_extra = []
+
+    if cert.get("expired"):
+        findings_extra.append({
+            "id": "cert_expired",
+            "severity": 3,
+            "title": "TLS certificate expired",
+            "evidence": cert.get("not_after"),
+        })
+    elif cert.get("days_left") is not None and cert["days_left"] < 14:
+        findings_extra.append({
+            "id": "cert_expiring_soon",
+            "severity": 2,
+            "title": "TLS certificate expiring soon",
+            "evidence": f"{cert['days_left']} days left",
+        })
+
+    if info.get("tls_version") in ("TLSv1", "TLSv1.1"):
+        findings_extra.append({
+            "id": "legacy_tls",
+            "severity": 3,
+            "title": "Legacy TLS version",
+            "evidence": info["tls_version"],
+        })
+
+    return info, findings_extra
 
 
-def main() -> None:
+# ── Process one host ───────────────────────────────────
+
+def process_host(ip: str, ports: list):
+    log(f"[*] Processing {ip} ({len(ports)} ports)")
+
+    # Network I/O first — no DB connection held
+    ptr = fetch_ptr(ip)
+    if ptr:
+        log(f"    domain (ptr): {ptr}")
+
+    geo = fetch_geo(ip)
+    if geo:
+        loc = ", ".join(
+            filter(None, [geo.get("city"), geo.get("region"), geo.get("country")])
+        )
+        log(f"    geo: {loc} | {geo.get('asn')} {geo.get('org') or ''}")
+    else:
+        log("    geo: lookup failed")
+
+    # Port scans (network) — collect results, then write DB in one short transaction
+    scan_results = []  # list of (port, proto, data, tls_info, tls_findings)
+
+    for port, proto in ports:
+        try:
+            data = run_module(ip, port, proto)
+            print(format_result(ip, data), flush=True)
+
+            tls_info, tls_findings = {}, []
+            service = (data.get("service") or "").lower()
+            if service == "https" or (proto == "tcp" and port in (443, 8443, 9443)):
+                tls_info, tls_findings = fetch_tls(ip, port)
+                for name in tls_info.get("domains") or []:
+                    log(f"    domain (cert): {name}")
+
+            scan_results.append((port, proto, data, tls_info, tls_findings))
+        except Exception as exc:
+            log(f"[!] {ip}:{port}/{proto}: {type(exc).__name__}: {exc}")
+
+    # Short DB transaction
+    host_id = None
+    with connect() as conn:
+        host_id = get_or_create_host(conn, ip)
+        scan_id = create_scan(conn, host_id, source="worker")
+
+        if ptr:
+            upsert_domain(conn, host_id, ptr, source="ptr")
+        if geo:
+            upsert_geo(conn, host_id, geo)
+
+        for port, proto, data, tls_info, tls_findings in scan_results:
+            obs_id = upsert_observation(conn, scan_id, host_id, data)
+
+            for item in data.get("findings") or []:
+                upsert_finding(conn, host_id, obs_id, item)
+
+            for name in (tls_info or {}).get("domains") or []:
+                upsert_domain(conn, host_id, name, source="cert")
+
+            for item in tls_findings or []:
+                upsert_finding(conn, host_id, obs_id, item)
+
+            service = (data.get("service") or "").lower()
+            for chain in get_chains_for_service(service):
+                enqueue_deep(conn, obs_id, chain)
+                log(f"    queued deep: {chain} (obs={obs_id})")
+
+        finish_scan(conn, scan_id, status="done")
+
+        # risk on same connection — no second lock
+        try:
+            score = update_host_score(host_id, conn=conn)
+            level = risk_level(score)
+            log(f"[RISK] {ip}: {score}/100 [{level}]")
+        except Exception as exc:
+            log(f"[!] Risk calculation failed for {ip}: {exc}")
+
+    # Deep tasks after connection is closed
+    run_pending_deep(limit=50)
+
+    log(f"[*] Finished {ip}")
+
+
+def _build_ctx(conn, obs_id: int) -> dict | None:
+    """Собирает ctx для deep-цепочки. Вызывается под DB-локом."""
+    row = conn.execute(
+        """
+        SELECT so.*, h.ip
+        FROM service_observations so
+        JOIN hosts h ON h.id = so.host_id
+        WHERE so.id = ?
+        """,
+        (obs_id,),
+    ).fetchone()
+
+    if not row:
+        return None
+
+    row = dict(row)
+
+    domains = [
+        r["name"]
+        for r in conn.execute(
+            "SELECT name FROM domains WHERE host_id = ?",
+            (row["host_id"],),
+        ).fetchall()
+    ]
+
+    geo_row = conn.execute(
+        "SELECT * FROM geo WHERE host_id = ?",
+        (row["host_id"],),
+    ).fetchone()
+    geo = dict(geo_row) if geo_row else None
+
+    raw = {}
+    if row.get("raw_json"):
+        try:
+            raw = json.loads(row["raw_json"])
+        except Exception:
+            pass
+
+    return {
+        "ip": row["ip"],
+        "port": row["port"],
+        "protocol": row["protocol"],
+        "service": row["service"],
+        "version": row["version"],
+        "banner": row["banner"],
+        "observation_id": obs_id,
+        "host_id": row["host_id"],
+        "domains": domains,
+        "geo": geo,
+        "raw": raw,
+    }
+
+
+def _run_one_deep(task: dict) -> tuple[int, int, str, dict | None, str | None]:
+    """
+    Выполняется в пуле потоков.
+    Возвращает: (task_id, obs_id, chain, result, error)
+    """
+    task_id = task["id"]
+    obs_id = task["observation_id"]
+    chain = task["chain"]
+    ctx = task.get("_ctx")
+
+    if ctx is None:
+        return task_id, obs_id, chain, None, "observation not found / no ctx"
+
+    log(f"    deep start: {chain} (obs={obs_id}, ip={ctx.get('ip')}:{ctx.get('port')})")
+    try:
+        result = run_chain(chain, ctx)
+        log(f"    deep finish: {chain} (obs={obs_id})")
+        return task_id, obs_id, chain, result, None
+    except Exception as exc:
+        log(f"    deep exception: {chain} (obs={obs_id}): {exc}")
+        return task_id, obs_id, chain, None, str(exc)
+
+
+def run_pending_deep(limit: int = 20):
+    """
+    Забирает pending deep-задачи, готовит ctx под DB-локом,
+    запускает тяжёлую работу (ffuf и т.п.) в ThreadPoolExecutor,
+    затем сохраняет результаты.
+    """
+    with connect() as conn:
+        tasks = [dict(t) for t in fetch_pending_deep(conn, limit=limit)]
+
+        if not tasks:
+            return
+
+        # Подготавливаем ctx и помечаем running, пока держим соединение
+        prepared = []
+        for task in tasks:
+            task_id = task["id"]
+            obs_id = task["observation_id"]
+            chain = task["chain"]
+
+            try:
+                mark_deep_running(conn, task_id)
+                ctx = _build_ctx(conn, obs_id)
+                if ctx is None:
+                    mark_deep_done(conn, task_id, error="observation not found")
+                    continue
+                task["_ctx"] = ctx
+                prepared.append(task)
+            except Exception as exc:
+                try:
+                    mark_deep_done(conn, task_id, error=str(exc))
+                except Exception:
+                    pass
+                log(f"    deep prepare fail: {chain}: {exc}")
+
+    if not prepared:
+        return
+
+    log(f"[*] Running {len(prepared)} deep task(s) in thread pool (workers={DEEP_WORKERS})")
+
+    # Запускаем все подготовленные задачи параллельно
+    futures = {
+        _executor.submit(_run_one_deep, task): task
+        for task in prepared
+    }
+
+    for future in concurrent.futures.as_completed(futures):
+        task = futures[future]
+        task_id = task["id"]
+        obs_id = task["observation_id"]
+        chain = task["chain"]
+
+        try:
+            task_id, obs_id, chain, result, error = future.result(timeout=DEEP_TIMEOUT)
+
+            with connect() as conn:
+                if error:
+                    mark_deep_done(conn, task_id, error=error)
+                    log(f"    deep fail: {chain} (obs={obs_id}): {error}")
+                else:
+                    save_deep_result(conn, task_id, obs_id, chain, result)
+                    mark_deep_done(conn, task_id)
+                    log(f"    deep ok: {chain} (obs={obs_id})")
+
+        except concurrent.futures.TimeoutError:
+            try:
+                with connect() as conn:
+                    mark_deep_done(conn, task_id, error=f"timeout after {DEEP_TIMEOUT}s")
+            except Exception:
+                pass
+            log(f"    deep timeout: {chain} (obs={obs_id})")
+
+        except Exception as exc:
+            try:
+                with connect() as conn:
+                    mark_deep_done(conn, task_id, error=str(exc))
+            except Exception:
+                pass
+            log(f"    deep fail: {chain} (obs={obs_id}): {exc}")
+
+
+def process_line(line: str):
+    line = line.strip()
+    if not line:
+        return
+
+    log(f"[*] Queue item: {line}")
+    parsed = parse_line(line)
+    if parsed is None:
+        log(f"[!] Skipping invalid queue item: {line}")
+        return
+
+    ip, ports = parsed
+    log(f"[*] Parsed: {ip} -> {', '.join(f'{p}/{pr}' for p, pr in ports)}")
+    process_host(ip, ports)
+
+
+def worker():
     OFFSET_FILE.parent.mkdir(parents=True, exist_ok=True)
-    QUEUE.touch(exist_ok=True)
-
     offset = load_offset()
-    print(f"[*] Worker started, offset={offset}", flush=True)
+
+    log("[*] Worker started")
+    log(f"[*] Queue: {QUEUE_FILE}")
+    log(f"[*] Offset: {offset}")
+    log(f"[*] Deep pool: {DEEP_WORKERS} workers, timeout={DEEP_TIMEOUT}s")
 
     while True:
-        data, end_pos = read_new_chunk(offset)
-
-        if not data:
+        if not QUEUE_FILE.exists():
+            run_pending_deep(limit=10)
             time.sleep(POLL_INTERVAL)
             continue
 
-        # Ищем последнюю полную строку (заканчивается на \n)
-        last_nl = data.rfind(b"\n")
-        if last_nl == -1:
-            # Нет ни одного \n — ждём дописывания строки, offset не двигаем
-            time.sleep(POLL_INTERVAL)
-            continue
+        try:
+            with QUEUE_FILE.open("r", encoding="utf-8") as queue:
+                queue.seek(0, os.SEEK_END)
+                file_size = queue.tell()
 
-        complete = data[: last_nl + 1]
-        # байты после последнего \n — неполная строка, их пока не трогаем
-        consumed = len(complete)
+                if offset > file_size:
+                    log("[!] Queue file truncated; resetting offset")
+                    offset = 0
 
-        text = complete.decode("utf-8", errors="replace")
-        for line in text.splitlines():
-            parsed = parse_line(line)
-            if parsed is None:
-                continue
-            ip, ports = parsed
-            try:
-                process(ip, ports)
-            except Exception as exc:
-                print(f"[!] {ip}: {exc}", flush=True)
+                queue.seek(offset)
 
-        offset = offset + consumed
-        save_offset(offset)
+                while True:
+                    line = queue.readline()
+                    if not line:
+                        break
+
+                    new_offset = queue.tell()
+                    if not line.endswith("\n"):
+                        break
+
+                    try:
+                        process_line(line)
+                        offset = new_offset
+                        save_offset(offset)
+                    except Exception as exc:
+                        log(f"[!] Failed to process line: {exc}")
+                        time.sleep(POLL_INTERVAL)
+                        break
+
+        except OSError as exc:
+            log(f"[!] Queue read error: {exc}")
+
+        run_pending_deep(limit=10)
+        time.sleep(POLL_INTERVAL)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Active Host Recon worker")
+    parser.add_argument("--reset", action="store_true", help="Reset worker offset")
+    args = parser.parse_args()
+
+    if args.reset:
+        save_offset(0)
+        log("[*] Worker offset reset")
+
+    init_db()
+    try:
+        worker()
+    finally:
+        _executor.shutdown(wait=True)
 
 
 if __name__ == "__main__":

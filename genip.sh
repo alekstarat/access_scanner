@@ -8,8 +8,6 @@ generate_octet() {
 
 echo "Started scanning. Successful wil appear in $OUTPUT_HOSTS"
 
-echo "\n==================================================\n" >> "$OUTPUT_FILE"
-
 while true; do
 	o1=$(generate_octet)
 	o2=$(generate_octet)
@@ -39,11 +37,9 @@ while true; do
 	if echo "$NMAP_RESULT" | grep -q "Host is up" && echo "$NMAP_RESULT" | grep -q "open"; then
 		PORTS=$(echo "$NMAP_RESULT" | grep "open" | awk '{print $1}' | tr '\n' ',' | sed 's/,$//')
 
-		RECORD="$TARGET_IP - Ports: $PORTS"
+		RECORD="$TARGET_IP $PORTS"
 
 		echo "[FOUND] $RECORD"
 		echo "$RECORD" >> "$OUTPUT_FILE"
 	fi
 done
-
-

@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{ host.ip }} · Access Scanner</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
+</head>
+<body data-prev="{% if prev_id %}{{ url_for('host_detail', host_id=prev_id) }}{% endif %}"
+      data-next="{% if next_id %}{{ url_for('host_detail', host_id=next_id) }}{% endif %}">
+<header class="topbar">
+    <div class="brand">
+        <span class="brand-mark">A</span>
+        <div>
+            <strong>Access Scanner</strong>
+            <small>host intelligence</small>
+        </div>
+    </div>
+    <div class="top-nav">
+        {% if prev_id %}
+        <a class="back" href="{{ url_for('host_detail', host_id=prev_id) }}" title="Previous (←)">← Prev</a>
+        {% endif %}
+        <a class="back" href="/">All hosts</a>
+        {% if next_id %}
+        <a class="back" href="{{ url_for('host_detail', host_id=next_id) }}" title="Next (→)">Next →</a>
+        {% endif %}
+    </div>
+</header>
+
+<div class="layout">
+    <aside class="sidebar">
+        <div class="sidebar-head">Hosts</div>
+        <div class="sidebar-list">
+            {% for h in nav_hosts %}
+            <a class="sidebar-item {% if h.id == host.id %}active{% endif %}"
+               href="{{ url_for('host_detail', host_id=h.id) }}">
+                <span class="mono">{{ h.ip }}</span>
+                <span class="sidebar-risk {{ h.risk_score|risk_class }}">{{ h.risk_score }}</span>
+            </a>
+            {% endfor %}
+        </div>
+        <div class="sidebar-hint">← → keys to navigate</div>
+    </aside>
+
+    <main class="container with-sidebar">
+        <section class="host-hero">
+            <div>
+                <div class="eyebrow">HOST</div>
+                <h1>{{ host.ip }}</h1>
+                <div class="host-meta">
+                    first {{ host.first_seen|short_time }}
+                    · last {{ host.last_seen|short_time }}
+                </div>
+                {% if domains %}
+                <div class="domain-tags">
+                    {% for d in domains %}
+                    <span class="tag mono">{{ d.name }}</span>
+                    {% endfor %}
+                </div>
+                {% endif %}
+            </div>
+            <div class="score-card {{ host.risk_score|risk_class }}">
+                <span>RISK SCORE</span>
+                <strong>{{ host.risk_score }}</strong>
+                <small>/ 100</small>
+            </div>
+        </section>
+
+        {% if geo %}
+        <section class="panel">
+            <div class="panel-head"><h2>Location</h2><span>{{ geo.source or 'geo' }}</span></div>
+            <div class="kv pad">
+                <span>place</span><b>{{ geo.city or '—' }}{% if geo.region %}, {{ geo.region }}{% endif %}{% if geo.country %}, {{ geo.country }}{% endif %}</b>
+                <span>asn / org</span><b>{{ geo.asn or '—' }} · {{ geo.org or geo.isp or '—' }}</b>
+            </div>
+        </section>
+        {% endif %}
+
+        <section class="grid-2">
+            <div class="panel">
+                <div class="panel-head"><h2>Services</h2><span>{{ services|length }}</span></div>
+                <div class="service-list">
+                    {% for s in services %}
+                    <div class="service-card">
+                        <div class="service-port">{{ s.port }}/{{ s.protocol }}</div>
+                        <div>
+                            <strong>{{ s.service or 'unknown' }}</strong>
+                            {% if s.version %}<div class="muted">{{ s.version }}</div>{% endif %}
+                            {% if s.banner %}<div class="mono">{{ s.banner }}</div>{% endif %}
+                        </div>
+                    </div>
+                    {% else %}
+                    <div class="empty">No service observations.</div>
+                    {% endfor %}
+                </div>
+            </div>
+
+            <div class="panel">
+                <div class="panel-head"><h2>Findings</h2><span>{{ findings|length }}</span></div>
+                <div class="finding-list">
+                    {% for f in findings %}
+                    <div class="finding-card">
+                        <div class="finding-badge {{ f.severity|severity_class }}">
+                            {{ f.severity|severity_name }}
+                        </div>
+                        <div>
+                            <strong>{{ f.title }}</strong>
+                            <div class="muted">{{ f.finding_key }} · {{ f.port }}/{{ f.protocol }}</div>
+                            {% if f.evidence %}<div class="evidence">{{ f.evidence }}</div>{% endif %}
+                        </div>
+                    </div>
+                    {% else %}
+                    <div class="empty">No findings.</div>
+                    {% endfor %}
+                </div>
+            </div>
+        </section>
+
+        <section class="panel timeline-panel">
+            <details class="collapse-block">
+                <summary class="panel-head as-summary">
+                    <div>
+                        <h2>Full host chain</h2>
+                        <p>Chronological detail — geo, domains, deep tasks, raw observations.</p>
+                    </div>
+                    <span>{{ events|length }} events</span>
+                </summary>
+
+                <div class="timeline">
+                    {% for event in events %}
+                    <article class="event {{ event.kind }}">
+                        <div class="event-line">
+                            <div class="event-dot {% if event.severity is not none %}{{ event.severity|severity_class }}{% endif %}">
+                                {{ event.icon }}
+                            </div>
+                        </div>
+
+                        <div class="event-card">
+                            <div class="event-head">
+                                <div>
+                                    <div class="event-title">{{ event.title }}</div>
+                                    <div class="event-subtitle">{{ event.subtitle }}</div>
+                                </div>
+                                <time>{{ event.timestamp|short_time }}</time>
+                            </div>
+
+                            {% if event.kind == "finding" %}
+                                {% if event.data.description %}<p>{{ event.data.description }}</p>{% endif %}
+                                {% if event.data.evidence %}<pre>{{ event.data.evidence }}</pre>{% endif %}
+
+                            {% elif event.kind == "service" %}
+                                <div class="kv">
+                                    <span>first seen</span><b>{{ event.data.first_seen|short_time }}</b>
+                                    <span>last seen</span><b>{{ event.data.last_seen|short_time }}</b>
+                                    {% if event.data.version %}
+                                    <span>version</span><b>{{ event.data.version }}</b>
+                                    {% endif %}
+                                </div>
+                                {% if event.data.observations %}
+                                <details>
+                                    <summary>Raw observations</summary>
+                                    <pre>{{ event.data.observations|pretty_json }}</pre>
+                                </details>
+                                {% endif %}
+
+                            {% elif event.kind == "deep_result" %}
+                                <pre>{{ event.data.value|pretty_json }}</pre>
+
+                            {% elif event.kind == "deep_task" %}
+                                <div class="kv">
+                                    <span>status</span><b>{{ event.data.status }}</b>
+                                    <span>priority</span><b>{{ event.data.priority }}</b>
+                                </div>
+                                {% if event.data.error %}<pre>{{ event.data.error }}</pre>{% endif %}
+
+                            {% else %}
+                                <div class="kv">
+                                    {% for key, value in event.data.items() %}
+                                        {% if value is not none and value != "" %}
+                                        <span>{{ key|replace("_", " ") }}</span><b>{{ value }}</b>
+                                        {% endif %}
+                                    {% endfor %}
+                                </div>
+                            {% endif %}
+                        </div>
+                    </article>
+                    {% endfor %}
+                </div>
+            </details>
+        </section>
+    </main>
+</div>
+
+<script>
+document.addEventListener('keydown', (e) => {
+  if (e.target.matches('input, textarea, select')) return;
+  const prev = document.body.dataset.prev;
+  const next = document.body.dataset.next;
+  if (e.key === 'ArrowLeft' && prev) location.href = prev;
+  if (e.key === 'ArrowRight' && next) location.href = next;
+});
+// keep active sidebar item visible
+const active = document.querySelector('.sidebar-item.active');
+if (active) active.scrollIntoView({ block: 'nearest' });
+</script>
+</body>
+</html>
