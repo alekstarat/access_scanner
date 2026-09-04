@@ -1,207 +1,322 @@
-<!doctype html>
-<html lang="en">
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>{{ host.ip }} · Access Scanner</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
-</head>
-<body data-prev="{% if prev_id %}{{ url_for('host_detail', host_id=prev_id) }}{% endif %}"
-      data-next="{% if next_id %}{{ url_for('host_detail', host_id=next_id) }}{% endif %}">
-<header class="topbar">
-    <div class="brand">
-        <span class="brand-mark">A</span>
-        <div>
-            <strong>Access Scanner</strong>
-            <small>host intelligence</small>
-        </div>
+{% extends "base.html" %}
+{% block title %}{{ profile.ip }} · Access Scanner{% endblock %}
+
+{% block topbar %}
+<h1>
+  <a href="{{ url_for('index') }}" style="color:var(--muted);text-decoration:none;margin-right:8px">←</a>
+  {{ profile.ip }}
+</h1>
+<div class="nav-arrows">
+  {% if prev_id %}
+  <a href="{{ url_for('host_detail', host_id=prev_id) }}" title="Previous">‹</a>
+  {% else %}
+  <a class="disabled">‹</a>
+  {% endif %}
+  {% if next_id %}
+  <a href="{{ url_for('host_detail', host_id=next_id) }}" title="Next">›</a>
+  {% else %}
+  <a class="disabled">›</a>
+  {% endif %}
+</div>
+<div class="stats" style="margin-left:auto">
+  <span><b>{{ summary.ports_open }}</b> ports</span>
+  <span><b>{{ summary.findings_count }}</b> findings</span>
+  <a href="{{ url_for('api_host', host_id=profile.id) }}" style="color:var(--muted);font-size:12px" target="_blank">JSON</a>
+</div>
+{% endblock %}
+
+{% block content %}
+<!-- Header -->
+<div class="host-header">
+  <div class="host-title">
+    <div class="ip">{{ profile.ip }}</div>
+    <div class="meta">
+      <span>id <b>{{ profile.id }}</b></span>
+      <span>first <b>{{ profile.first_seen | short_time }}</b></span>
+      <span>last <b>{{ profile.last_seen | short_time }}</b></span>
+      {% if summary.services %}
+      <span>
+        {% for s in summary.services %}
+          <span class="tag service">{{ s }}</span>
+        {% endfor %}
+      </span>
+      {% endif %}
     </div>
-    <div class="top-nav">
-        {% if prev_id %}
-        <a class="back" href="{{ url_for('host_detail', host_id=prev_id) }}" title="Previous (←)">← Prev</a>
-        {% endif %}
-        <a class="back" href="/">All hosts</a>
-        {% if next_id %}
-        <a class="back" href="{{ url_for('host_detail', host_id=next_id) }}" title="Next (→)">Next →</a>
-        {% endif %}
-    </div>
-</header>
-
-<div class="layout">
-    <aside class="sidebar">
-        <div class="sidebar-head">Hosts</div>
-        <div class="sidebar-list">
-            {% for h in nav_hosts %}
-            <a class="sidebar-item {% if h.id == host.id %}active{% endif %}"
-               href="{{ url_for('host_detail', host_id=h.id) }}">
-                <span class="mono">{{ h.ip }}</span>
-                <span class="sidebar-risk {{ h.risk_score|risk_class }}">{{ h.risk_score }}</span>
-            </a>
-            {% endfor %}
-        </div>
-        <div class="sidebar-hint">← → keys to navigate</div>
-    </aside>
-
-    <main class="container with-sidebar">
-        <section class="host-hero">
-            <div>
-                <div class="eyebrow">HOST</div>
-                <h1>{{ host.ip }}</h1>
-                <div class="host-meta">
-                    first {{ host.first_seen|short_time }}
-                    · last {{ host.last_seen|short_time }}
-                </div>
-                {% if domains %}
-                <div class="domain-tags">
-                    {% for d in domains %}
-                    <span class="tag mono">{{ d.name }}</span>
-                    {% endfor %}
-                </div>
-                {% endif %}
-            </div>
-            <div class="score-card {{ host.risk_score|risk_class }}">
-                <span>RISK SCORE</span>
-                <strong>{{ host.risk_score }}</strong>
-                <small>/ 100</small>
-            </div>
-        </section>
-
-        {% if geo %}
-        <section class="panel">
-            <div class="panel-head"><h2>Location</h2><span>{{ geo.source or 'geo' }}</span></div>
-            <div class="kv pad">
-                <span>place</span><b>{{ geo.city or '—' }}{% if geo.region %}, {{ geo.region }}{% endif %}{% if geo.country %}, {{ geo.country }}{% endif %}</b>
-                <span>asn / org</span><b>{{ geo.asn or '—' }} · {{ geo.org or geo.isp or '—' }}</b>
-            </div>
-        </section>
-        {% endif %}
-
-        <section class="grid-2">
-            <div class="panel">
-                <div class="panel-head"><h2>Services</h2><span>{{ services|length }}</span></div>
-                <div class="service-list">
-                    {% for s in services %}
-                    <div class="service-card">
-                        <div class="service-port">{{ s.port }}/{{ s.protocol }}</div>
-                        <div>
-                            <strong>{{ s.service or 'unknown' }}</strong>
-                            {% if s.version %}<div class="muted">{{ s.version }}</div>{% endif %}
-                            {% if s.banner %}<div class="mono">{{ s.banner }}</div>{% endif %}
-                        </div>
-                    </div>
-                    {% else %}
-                    <div class="empty">No service observations.</div>
-                    {% endfor %}
-                </div>
-            </div>
-
-            <div class="panel">
-                <div class="panel-head"><h2>Findings</h2><span>{{ findings|length }}</span></div>
-                <div class="finding-list">
-                    {% for f in findings %}
-                    <div class="finding-card">
-                        <div class="finding-badge {{ f.severity|severity_class }}">
-                            {{ f.severity|severity_name }}
-                        </div>
-                        <div>
-                            <strong>{{ f.title }}</strong>
-                            <div class="muted">{{ f.finding_key }} · {{ f.port }}/{{ f.protocol }}</div>
-                            {% if f.evidence %}<div class="evidence">{{ f.evidence }}</div>{% endif %}
-                        </div>
-                    </div>
-                    {% else %}
-                    <div class="empty">No findings.</div>
-                    {% endfor %}
-                </div>
-            </div>
-        </section>
-
-        <section class="panel timeline-panel">
-            <details class="collapse-block">
-                <summary class="panel-head as-summary">
-                    <div>
-                        <h2>Full host chain</h2>
-                        <p>Chronological detail — geo, domains, deep tasks, raw observations.</p>
-                    </div>
-                    <span>{{ events|length }} events</span>
-                </summary>
-
-                <div class="timeline">
-                    {% for event in events %}
-                    <article class="event {{ event.kind }}">
-                        <div class="event-line">
-                            <div class="event-dot {% if event.severity is not none %}{{ event.severity|severity_class }}{% endif %}">
-                                {{ event.icon }}
-                            </div>
-                        </div>
-
-                        <div class="event-card">
-                            <div class="event-head">
-                                <div>
-                                    <div class="event-title">{{ event.title }}</div>
-                                    <div class="event-subtitle">{{ event.subtitle }}</div>
-                                </div>
-                                <time>{{ event.timestamp|short_time }}</time>
-                            </div>
-
-                            {% if event.kind == "finding" %}
-                                {% if event.data.description %}<p>{{ event.data.description }}</p>{% endif %}
-                                {% if event.data.evidence %}<pre>{{ event.data.evidence }}</pre>{% endif %}
-
-                            {% elif event.kind == "service" %}
-                                <div class="kv">
-                                    <span>first seen</span><b>{{ event.data.first_seen|short_time }}</b>
-                                    <span>last seen</span><b>{{ event.data.last_seen|short_time }}</b>
-                                    {% if event.data.version %}
-                                    <span>version</span><b>{{ event.data.version }}</b>
-                                    {% endif %}
-                                </div>
-                                {% if event.data.observations %}
-                                <details>
-                                    <summary>Raw observations</summary>
-                                    <pre>{{ event.data.observations|pretty_json }}</pre>
-                                </details>
-                                {% endif %}
-
-                            {% elif event.kind == "deep_result" %}
-                                <pre>{{ event.data.value|pretty_json }}</pre>
-
-                            {% elif event.kind == "deep_task" %}
-                                <div class="kv">
-                                    <span>status</span><b>{{ event.data.status }}</b>
-                                    <span>priority</span><b>{{ event.data.priority }}</b>
-                                </div>
-                                {% if event.data.error %}<pre>{{ event.data.error }}</pre>{% endif %}
-
-                            {% else %}
-                                <div class="kv">
-                                    {% for key, value in event.data.items() %}
-                                        {% if value is not none and value != "" %}
-                                        <span>{{ key|replace("_", " ") }}</span><b>{{ value }}</b>
-                                        {% endif %}
-                                    {% endfor %}
-                                </div>
-                            {% endif %}
-                        </div>
-                    </article>
-                    {% endfor %}
-                </div>
-            </details>
-        </section>
-    </main>
+  </div>
+  <div class="risk-card">
+    <div class="score sev-{{ profile.risk_score | risk_class }}">{{ profile.risk_score }}</div>
+    <div class="label">{{ profile.risk_score | risk_class }} risk</div>
+  </div>
 </div>
 
+<!-- Summary bar -->
+<div class="summary-bar">
+  <div class="summary-chip"><b>{{ summary.ports_open }}</b> open ports</div>
+  <div class="summary-chip"><b>{{ summary.findings_count }}</b> findings</div>
+  <div class="summary-chip"><b>sev {{ summary.max_severity }}</b> max</div>
+  <div class="summary-chip"><b>{{ profile.domains | length }}</b> domains</div>
+</div>
+
+<!-- Geo + Domains -->
+<div class="grid-2 section">
+  <div class="card">
+    <h3>Geo / Network</h3>
+    {% if profile.geo %}
+    {% set g = profile.geo %}
+    <dl>
+      <dt>Location</dt>
+      <dd>
+        {% if g.city %}{{ g.city }}{% if g.region or g.country %}, {% endif %}{% endif %}
+        {% if g.region %}{{ g.region }}{% if g.country %}, {% endif %}{% endif %}
+        {{ g.country or ('—' if not g.city and not g.region else '') }}
+      </dd>
+      <dt>Country</dt>
+      <dd>{{ g.country or '—' }} {% if g.country_code %}<span class="muted">({{ g.country_code }})</span>{% endif %}</dd>
+      <dt>ASN</dt>
+      <dd>{{ g.asn or '—' }}</dd>
+      <dt>Org</dt>
+      <dd>{{ g.org or '—' }}</dd>
+      <dt>ISP</dt>
+      <dd>{{ g.isp or '—' }}</dd>
+      <dt>Coords</dt>
+      <dd class="mono">{% if g.lat is not none %}{{ g.lat }}, {{ g.lon }}{% else %}—{% endif %}</dd>
+      <dt>Source</dt>
+      <dd class="muted">{{ g.source or '—' }} · {{ g.looked_up_at | short_time }}</dd>
+    </dl>
+    {% else %}
+    <div class="empty">Нет geo-данных</div>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <h3>Domains <span class="count">{{ profile.domains | length }}</span></h3>
+    {% if profile.domains %}
+    <div class="domain-list">
+      {% for d in profile.domains %}
+      <div class="domain-chip">
+        {{ d.name }}
+        <span class="src">{{ d.source }}</span>
+      </div>
+      {% endfor %}
+    </div>
+    {% else %}
+    <div class="empty">Домены не найдены</div>
+    {% endif %}
+  </div>
+</div>
+
+<!-- Host-level findings -->
+{% if profile.host_findings %}
+<div class="section">
+  <div class="section-title">Host findings <span class="count">{{ profile.host_findings | length }}</span></div>
+  <div class="card">
+    {% for f in profile.host_findings %}
+    <div class="finding-item">
+      <div class="finding-sev sev-{{ f.severity | severity_class }}">{{ f.severity | severity_name }}</div>
+      <div class="finding-body">
+        <div class="title">{{ f.title }}</div>
+        {% if f.evidence %}<div class="evidence">{{ f.evidence }}</div>{% endif %}
+        {% if f.description %}<div class="desc">{{ f.description }}</div>{% endif %}
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+</div>
+{% endif %}
+
+<!-- Services -->
+<div class="section">
+  <div class="section-title">
+    Services
+    <span class="count">{{ profile.services | length }}</span>
+  </div>
+
+  {% if not profile.services %}
+  <div class="empty">Нет наблюдений сервисов</div>
+  {% endif %}
+
+  <div class="service-list">
+    {% for svc in profile.services %}
+    <div class="service-card" id="svc-{{ svc.observation_id }}">
+      <div class="service-card-head" onclick="this.parentElement.classList.toggle('open')">
+        <span class="port">{{ svc.port }}/{{ svc.protocol }}</span>
+        <span class="svc-name">{{ svc.service or 'unknown' }}</span>
+        <span class="version">{{ (svc.version or svc.banner or '') | truncate(80) }}</span>
+        <div class="badges">
+          {% if svc.findings %}
+          <span class="pill findings">{{ svc.findings | length }} findings</span>
+          {% endif %}
+          {% if svc.deep_tasks %}
+          <span class="pill deep">{{ svc.deep_tasks | length }} deep</span>
+          {% endif %}
+        </div>
+      </div>
+
+      <div class="service-card-body">
+        <div class="svc-grid">
+          <!-- Left: primary info -->
+          <div>
+            <div class="block">
+              <div class="block-title">Primary</div>
+              <dl class="kv">
+                <dt>Service</dt>
+                <dd>{{ svc.service or '—' }}</dd>
+                <dt>Version</dt>
+                <dd>{{ svc.version or '—' }}</dd>
+                <dt>First seen</dt>
+                <dd>{{ svc.first_seen | short_time }}</dd>
+                <dt>Last seen</dt>
+                <dd>{{ svc.last_seen | short_time }}</dd>
+                <dt>Obs ID</dt>
+                <dd class="muted">{{ svc.observation_id }}</dd>
+              </dl>
+            </div>
+
+            {% if svc.banner %}
+            <div class="block">
+              <div class="block-title">Banner</div>
+              <div class="banner-box">{{ svc.banner }}</div>
+            </div>
+            {% endif %}
+
+            {% if svc.observations %}
+            <div class="block">
+              <div class="block-title">Observations</div>
+              <dl class="kv">
+                {% for k, v in svc.observations.items() %}
+                  {% if v is not none and k not in ('banner',) %}
+                  <dt>{{ k }}</dt>
+                  <dd>
+                    {% if v is mapping or v is iterable and v is not string %}
+                      <span class="muted">{{ v | tojson | truncate(100) }}</span>
+                    {% else %}
+                      {{ v }}
+                    {% endif %}
+                  </dd>
+                  {% endif %}
+                {% endfor %}
+              </dl>
+            </div>
+            {% endif %}
+          </div>
+
+          <!-- Right: findings + deep -->
+          <div>
+            {% if svc.findings %}
+            <div class="block">
+              <div class="block-title">Findings ({{ svc.findings | length }})</div>
+              {% for f in svc.findings %}
+              <div class="finding-item">
+                <div class="finding-sev sev-{{ f.severity | severity_class }}">{{ f.severity | severity_name }}</div>
+                <div class="finding-body">
+                  <div class="title">{{ f.title }}</div>
+                  {% if f.evidence %}<div class="evidence">{{ f.evidence }}</div>{% endif %}
+                  {% if f.description %}<div class="desc">{{ f.description }}</div>{% endif %}
+                </div>
+              </div>
+              {% endfor %}
+            </div>
+            {% endif %}
+
+            {% if svc.deep_tasks %}
+            <div class="block">
+              <div class="block-title">Deep chains</div>
+              {% for task in svc.deep_tasks %}
+              <div class="deep-task">
+                <div class="deep-task-head">
+                  <span class="chain">{{ task.chain }}</span>
+                  <span class="status {{ task.status }}">{{ task.status }}</span>
+                  {% if task.error %}
+                  <span class="sev-critical" style="font-size:11px">{{ task.error | truncate(60) }}</span>
+                  {% endif %}
+                  <span class="muted" style="margin-left:auto;font-size:11px">
+                    {{ task.finished_at | short_time if task.finished_at else task.created_at | short_time }}
+                  </span>
+                </div>
+                {# Один полный снимок (ключ = имя chain). Остальные deep_results — дубли полей. #}
+                {% set primary = task.results
+                    | selectattr('key', 'equalto', task.chain)
+                    | list %}
+                {% if primary %}
+                <div class="deep-result">
+                  <pre>{{ primary[0].value | pretty_json }}</pre>
+                </div>
+                {% elif task.results %}
+                <div class="deep-result">
+                  <pre>{{ task.results[0].value | pretty_json }}</pre>
+                </div>
+                {% elif task.status == 'done' %}
+                <div class="deep-result muted">Нет сохранённых результатов</div>
+                {% endif %}
+              </div>
+              {% endfor %}
+            </div>
+            {% elif svc.deep %}
+            <div class="block">
+              <div class="block-title">Deep (aggregated)</div>
+              <pre class="banner-box" style="max-height:240px">{{ svc.deep | pretty_json }}</pre>
+            </div>
+            {% endif %}
+          </div>
+        </div>
+
+        <!-- Raw JSON toggle -->
+        <span class="json-toggle" onclick="
+          var p = this.nextElementSibling;
+          p.classList.toggle('open');
+          this.textContent = p.classList.contains('open') ? 'Hide raw JSON' : 'Show raw JSON';
+        ">Show raw JSON</span>
+        <div class="json-panel">{{ svc.raw | pretty_json }}</div>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+</div>
+
+<!-- All findings flat list -->
+{% set all_f = profile.all_findings() %}
+{% if all_f %}
+<div class="section">
+  <div class="section-title">All findings <span class="count">{{ all_f | length }}</span></div>
+  <div class="card">
+    {% for f in all_f | sort(attribute='severity', reverse=true) %}
+    <div class="finding-item">
+      <div class="finding-sev sev-{{ f.severity | severity_class }}">{{ f.severity | severity_name }}</div>
+      <div class="finding-body">
+        <div class="title">
+          {{ f.title }}
+          {% if f.observation_id %}
+          <a href="#svc-{{ f.observation_id }}" class="muted" style="font-size:11px;margin-left:8px">→ service</a>
+          {% endif %}
+        </div>
+        {% if f.evidence %}<div class="evidence">{{ f.evidence }}</div>{% endif %}
+        {% if f.description %}<div class="desc">{{ f.description }}</div>{% endif %}
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+</div>
+{% endif %}
+
+{% endblock %}
+
+{% block scripts %}
 <script>
-document.addEventListener('keydown', (e) => {
-  if (e.target.matches('input, textarea, select')) return;
-  const prev = document.body.dataset.prev;
-  const next = document.body.dataset.next;
-  if (e.key === 'ArrowLeft' && prev) location.href = prev;
-  if (e.key === 'ArrowRight' && next) location.href = next;
+// Open service cards that have findings or deep by default
+document.querySelectorAll('.service-card').forEach(function(card) {
+  var hasFindings = card.querySelector('.pill.findings');
+  var hasDeep = card.querySelector('.pill.deep');
+  if (hasFindings || hasDeep) {
+    card.classList.add('open');
+  }
 });
-// keep active sidebar item visible
-const active = document.querySelector('.sidebar-item.active');
-if (active) active.scrollIntoView({ block: 'nearest' });
+// Open specific service if hash present
+if (location.hash && location.hash.startsWith('#svc-')) {
+  var el = document.querySelector(location.hash);
+  if (el) {
+    el.classList.add('open');
+    el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+}
 </script>
-</body>
-</html>
+{% endblock %}

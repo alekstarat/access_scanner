@@ -511,3 +511,17 @@ def save_result(ip, data):
 if __name__ == "__main__":
     init_db()
     print(f"DB ready: {DB_PATH}")
+
+# ── Host-centric helpers (use models.HostProfile for full view) ─
+
+def get_full_host(host_id: int = None, ip: str = None):
+    """
+    Convenience wrapper.
+    Prefer: from models import get_host_by_id / get_host_by_ip
+    """
+    from models import get_host_by_id, get_host_by_ip
+    if host_id is not None:
+        return get_host_by_id(host_id)
+    if ip is not None:
+        return get_host_by_ip(ip)
+    raise ValueError("host_id or ip required")

@@ -29,19 +29,12 @@ from intelligence.geo import lookup as geo_lookup
 from intelligence.dns import reverse_dns
 from intelligence.tls_info import probe as tls_probe
 from chains.registry import get_chains_for_service, run_chain
-from chains.ssh import ssh
+import deep_runner
 
 
 QUEUE_FILE = Path("active_hosts.txt")
 OFFSET_FILE = Path("state/worker.offset")
 POLL_INTERVAL = 1.0
-
-# Сколько deep-задач можно выполнять параллельно
-DEEP_WORKERS = 4
-# Максимальное время на одну deep-задачу (секунды)
-DEEP_TIMEOUT = 300
-
-_executor = concurrent.futures.ThreadPoolExecutor(max_workers=DEEP_WORKERS)
 
 
 def log(message: str):
@@ -218,12 +211,13 @@ def process_host(ip: str, ports: list):
 
             service = (data.get("service") or "").lower()
             for chain in get_chains_for_service(service):
-                enqueue_deep(conn, obs_id, chain)
-                log(f"    queued deep: {chain} (obs={obs_id})")
+                # heavy chains — ниже priority, чтобы лёгкие не ждали
+                priority = 0 if deep_runner.is_heavy(chain) else 10
+                enqueue_deep(conn, obs_id, chain, priority=priority)
+                log(f"    queued deep: {chain} (obs={obs_id}, prio={priority})")
 
         finish_scan(conn, scan_id, status="done")
 
-        # risk on same connection — no second lock
         try:
             score = update_host_score(host_id, conn=conn)
             level = risk_level(score)
@@ -232,13 +226,13 @@ def process_host(ip: str, ports: list):
             log(f"[!] Risk calculation failed for {ip}: {exc}")
 
     # Deep tasks after connection is closed
-    run_pending_deep(limit=50)
+    run_pending_deep()
 
     log(f"[*] Finished {ip}")
 
 
 def _build_ctx(conn, obs_id: int) -> dict | None:
-    """Собирает ctx для deep-цепочки. Вызывается под DB-локом."""
+    """Собирает ctx для deep-цепочки. Вызывается под DB-локом"""
     row = conn.execute(
         """
         SELECT so.*, h.ip
@@ -294,6 +288,9 @@ def _run_one_deep(task: dict) -> tuple[int, int, str, dict | None, str | None]:
     """
     Выполняется в пуле потоков.
     Возвращает: (task_id, obs_id, chain, result, error)
+
+    Тяжёлые bash-цепочки внутри run_chain должны звать deep_runner.run_bash()
+    — тогда timeout реально убивает process group.
     """
     task_id = task["id"]
     obs_id = task["observation_id"]
@@ -303,29 +300,37 @@ def _run_one_deep(task: dict) -> tuple[int, int, str, dict | None, str | None]:
     if ctx is None:
         return task_id, obs_id, chain, None, "observation not found / no ctx"
 
-    log(f"    deep start: {chain} (obs={obs_id}, ip={ctx.get('ip')}:{ctx.get('port')})")
+    heavy = deep_runner.is_heavy(chain)
+    tag = "heavy" if heavy else "light"
+    log(f"    deep start: {chain} [{tag}] (obs={obs_id}, ip={ctx.get('ip')}:{ctx.get('port')})")
+    t0 = time.monotonic()
     try:
         result = run_chain(chain, ctx)
-        log(f"    deep finish: {chain} (obs={obs_id})")
+        dt = time.monotonic() - t0
+        log(f"    deep finish: {chain} ({dt:.1f}s)")
         return task_id, obs_id, chain, result, None
     except Exception as exc:
         log(f"    deep exception: {chain} (obs={obs_id}): {exc}")
         return task_id, obs_id, chain, None, str(exc)
 
 
-def run_pending_deep(limit: int = 20):
+def run_pending_deep(limit: int | None = None):
     """
     Забирает pending deep-задачи, готовит ctx под DB-локом,
-    запускает тяжёлую работу (ffuf и т.п.) в ThreadPoolExecutor,
-    затем сохраняет результаты.
+    запускает в deep_runner pool (лимит workers + bash_limit),
+    сохраняет результаты.
     """
+    if limit is None:
+        limit = deep_runner.DEEP_BATCH
+
+    deep_runner.start()
+
     with connect() as conn:
         tasks = [dict(t) for t in fetch_pending_deep(conn, limit=limit)]
 
         if not tasks:
             return
 
-        # Подготавливаем ctx и помечаем running, пока держим соединение
         prepared = []
         for task in tasks:
             task_id = task["id"]
@@ -350,11 +355,15 @@ def run_pending_deep(limit: int = 20):
     if not prepared:
         return
 
-    log(f"[*] Running {len(prepared)} deep task(s) in thread pool (workers={DEEP_WORKERS})")
+    cfg = deep_runner.stats()
+    log(
+        f"[*] Running {len(prepared)} deep task(s) "
+        f"(workers={cfg['workers']}, bash_limit={cfg['bash_limit']}, "
+        f"timeout={cfg['timeout']}s)"
+    )
 
-    # Запускаем все подготовленные задачи параллельно
     futures = {
-        _executor.submit(_run_one_deep, task): task
+        deep_runner.submit(_run_one_deep, task): task
         for task in prepared
     }
 
@@ -363,9 +372,12 @@ def run_pending_deep(limit: int = 20):
         task_id = task["id"]
         obs_id = task["observation_id"]
         chain = task["chain"]
+        # Страховка: если handler завис без run_bash — future timeout.
+        # Для run_bash kill сработает раньше, внутри.
+        timeout = deep_runner.DEEP_TIMEOUT + 15
 
         try:
-            task_id, obs_id, chain, result, error = future.result(timeout=DEEP_TIMEOUT)
+            task_id, obs_id, chain, result, error = future.result(timeout=timeout)
 
             with connect() as conn:
                 if error:
@@ -373,13 +385,24 @@ def run_pending_deep(limit: int = 20):
                     log(f"    deep fail: {chain} (obs={obs_id}): {error}")
                 else:
                     save_deep_result(conn, task_id, obs_id, chain, result)
+                    if isinstance(result, dict):
+                        for k, v in result.items():
+                            if k == chain:
+                                continue
+                            try:
+                                save_deep_result(conn, task_id, obs_id, str(k), v)
+                            except Exception:
+                                pass
                     mark_deep_done(conn, task_id)
                     log(f"    deep ok: {chain} (obs={obs_id})")
 
         except concurrent.futures.TimeoutError:
             try:
                 with connect() as conn:
-                    mark_deep_done(conn, task_id, error=f"timeout after {DEEP_TIMEOUT}s")
+                    mark_deep_done(
+                        conn, task_id,
+                        error=f"timeout after {deep_runner.DEEP_TIMEOUT}s",
+                    )
             except Exception:
                 pass
             log(f"    deep timeout: {chain} (obs={obs_id})")
@@ -413,14 +436,19 @@ def worker():
     OFFSET_FILE.parent.mkdir(parents=True, exist_ok=True)
     offset = load_offset()
 
+    cfg = deep_runner.stats()
     log("[*] Worker started")
     log(f"[*] Queue: {QUEUE_FILE}")
     log(f"[*] Offset: {offset}")
-    log(f"[*] Deep pool: {DEEP_WORKERS} workers, timeout={DEEP_TIMEOUT}s")
+    log(
+        f"[*] Deep pool: workers={cfg['workers']}, "
+        f"bash_limit={cfg['bash_limit']}, timeout={cfg['timeout']}s, "
+        f"batch={cfg['batch']}"
+    )
 
     while True:
         if not QUEUE_FILE.exists():
-            run_pending_deep(limit=10)
+            run_pending_deep()
             time.sleep(POLL_INTERVAL)
             continue
 
@@ -456,24 +484,48 @@ def worker():
         except OSError as exc:
             log(f"[!] Queue read error: {exc}")
 
-        run_pending_deep(limit=10)
+        run_pending_deep()
         time.sleep(POLL_INTERVAL)
 
 
 def main():
     parser = argparse.ArgumentParser(description="Active Host Recon worker")
     parser.add_argument("--reset", action="store_true", help="Reset worker offset")
+    parser.add_argument(
+        "--deep-workers", type=int, default=None,
+        help="Python thread pool size for deep tasks (env DEEP_WORKERS, default 4)",
+    )
+    parser.add_argument(
+        "--bash-limit", type=int, default=None,
+        help="Max concurrent bash/subprocess chains (env DEEP_BASH_LIMIT, default 2)",
+    )
+    parser.add_argument(
+        "--deep-timeout", type=int, default=None,
+        help="Timeout per deep task in seconds (env DEEP_TIMEOUT, default 300)",
+    )
+    parser.add_argument(
+        "--deep-batch", type=int, default=None,
+        help="How many pending deep tasks to claim per cycle (env DEEP_BATCH, default 20)",
+    )
     args = parser.parse_args()
+
+    deep_runner.configure(
+        workers=args.deep_workers,
+        bash_limit=args.bash_limit,
+        timeout=args.deep_timeout,
+        batch=args.deep_batch,
+    )
 
     if args.reset:
         save_offset(0)
         log("[*] Worker offset reset")
 
     init_db()
+    deep_runner.start()
     try:
         worker()
     finally:
-        _executor.shutdown(wait=True)
+        deep_runner.shutdown(wait=True)
 
 
 if __name__ == "__main__":

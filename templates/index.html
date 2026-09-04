@@ -1,138 +1,126 @@
-<!doctype html>
-<html lang="en">
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Access Scanner</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
-</head>
-<body>
-<header class="topbar">
-    <div class="brand">
-        <span class="brand-mark">A</span>
-        <div>
-            <strong>Access Scanner</strong>
-            <small>recon intelligence</small>
-        </div>
-    </div>
-    <form class="search" method="get" action="/">
-        <input name="q" value="{{ query }}" placeholder="IP, domain, service, banner…">
-        <button type="submit">Search</button>
-    </form>
-</header>
+{% extends "base.html" %}
+{% block title %}Hosts · Access Scanner{% endblock %}
 
-<div class="layout">
-    <aside class="sidebar">
-        <div class="sidebar-head">Hosts</div>
-        <div class="sidebar-list">
-            {% for h in nav_hosts %}
-            <a class="sidebar-item" href="{{ url_for('host_detail', host_id=h.id) }}">
-                <span class="mono">{{ h.ip }}</span>
-                <span class="sidebar-risk {{ h.risk_score|risk_class }}">{{ h.risk_score }}</span>
-            </a>
-            {% else %}
-            <div class="empty-sm">No hosts</div>
-            {% endfor %}
-        </div>
-    </aside>
-
-    <main class="container with-sidebar">
-        <section class="hero">
-            <div>
-                <div class="eyebrow">HOST INVENTORY</div>
-                <h1>Recon overview</h1>
-                <p>Hosts, services, domains, findings and deep-chain results.</p>
-            </div>
-            <div class="stats">
-                <div class="stat"><b>{{ stats.hosts }}</b><span>hosts</span></div>
-                <div class="stat"><b>{{ stats.services }}</b><span>observations</span></div>
-                <div class="stat"><b>{{ stats.findings }}</b><span>findings</span></div>
-                <div class="stat danger"><b>{{ stats.critical }}</b><span>critical</span></div>
-            </div>
-        </section>
-
-        <section class="panel filters-panel">
-            <form class="filters" method="get" action="/">
-                <input type="hidden" name="q" value="{{ query }}">
-                <label>
-                    <span>Service</span>
-                    <select name="service">
-                        <option value="">All services</option>
-                        {% for s in services %}
-                        <option value="{{ s }}" {% if service == s %}selected{% endif %}>{{ s }}</option>
-                        {% endfor %}
-                    </select>
-                </label>
-                <label>
-                    <span>Risk</span>
-                    <select name="risk">
-                        <option value="">All risk</option>
-                        {% for r in ['low','medium','high','critical'] %}
-                        <option value="{{ r }}" {% if risk == r %}selected{% endif %}>{{ r }}</option>
-                        {% endfor %}
-                    </select>
-                </label>
-                <label>
-                    <span>Country</span>
-                    <select name="country">
-                        <option value="">All countries</option>
-                        {% for c in countries %}
-                        <option value="{{ c }}" {% if country == c %}selected{% endif %}>{{ c }}</option>
-                        {% endfor %}
-                    </select>
-                </label>
-                <label>
-                    <span>Domain</span>
-                    <select name="has_domain">
-                        <option value="">Any</option>
-                        <option value="1" {% if has_domain == '1' %}selected{% endif %}>Has domain</option>
-                        <option value="0" {% if has_domain == '0' %}selected{% endif %}>No domain</option>
-                    </select>
-                </label>
-                <div class="filter-actions">
-                    <button type="submit">Apply</button>
-                    <a class="back" href="/">Reset</a>
-                </div>
-            </form>
-        </section>
-
-        <section class="panel">
-            <div class="panel-head">
-                <h2>Hosts</h2>
-                <span>{{ hosts|length }} shown</span>
-            </div>
-
-            <div class="host-list">
-                {% for host in hosts %}
-                <a class="host-row" href="{{ url_for('host_detail', host_id=host.id) }}">
-                    <div class="host-main">
-                        <div class="host-ip">{{ host.ip }}</div>
-                        <div class="host-meta">
-                            {% if host.domains_preview %}
-                            <span class="domain-preview">{{ host.domains_preview }}{% if host.domain_count > 3 %} +{{ host.domain_count - 3 }}{% endif %}</span>
-                            ·
-                            {% endif %}
-                            {% if host.city or host.country %}
-                            {{ host.city or '' }}{% if host.city and host.country %}, {% endif %}{{ host.country or '' }}
-                            ·
-                            {% endif %}
-                            last {{ host.last_seen|short_time }}
-                            · {{ host.service_count }} svc
-                            · {{ host.finding_count }} find
-                        </div>
-                    </div>
-                    <div class="host-risk {{ host.risk_score|risk_class }}">
-                        <strong>{{ host.risk_score }}</strong>
-                        <span>/100</span>
-                    </div>
-                    <div class="arrow">→</div>
-                </a>
-                {% else %}
-                <div class="empty">No hosts found.</div>
-                {% endfor %}
-            </div>
-        </section>
-    </main>
+{% block topbar %}
+<h1>Hosts</h1>
+<div class="stats">
+  <span><b>{{ stats.hosts }}</b> hosts</span>
+  <span><b>{{ stats.services }}</b> services</span>
+  <span><b>{{ stats.findings }}</b> findings</span>
+  <span><b>{{ stats.critical }}</b> high+</span>
+  <a href="{{ url_for('tasks_page') }}" class="task-stat {% if stats.tasks_running %}running{% elif stats.tasks_pending %}pending{% endif %}" style="text-decoration:none">
+    <b>{{ stats.tasks_running }}</b> run · <b>{{ stats.tasks_pending }}</b> queue
+  </a>
 </div>
-</body>
-</html>
+{% endblock %}
+
+{% block content %}
+<form class="filters" method="get" action="{{ url_for('index') }}">
+  <input type="search" name="q" value="{{ query }}" placeholder="IP, domain, org, banner…">
+  <select name="service">
+    <option value="">All services</option>
+    {% for s in services %}
+    <option value="{{ s }}" {% if service == s %}selected{% endif %}>{{ s }}</option>
+    {% endfor %}
+  </select>
+  <select name="risk">
+    <option value="">All risk</option>
+    <option value="critical" {% if risk == 'critical' %}selected{% endif %}>Critical ≥70</option>
+    <option value="high" {% if risk == 'high' %}selected{% endif %}>High 40–69</option>
+    <option value="medium" {% if risk == 'medium' %}selected{% endif %}>Medium 20–39</option>
+    <option value="low" {% if risk == 'low' %}selected{% endif %}>Low &lt;20</option>
+  </select>
+  <select name="country">
+    <option value="">All countries</option>
+    {% for c in countries %}
+    <option value="{{ c }}" {% if country == c %}selected{% endif %}>{{ c }}</option>
+    {% endfor %}
+  </select>
+  <select name="has_domain">
+    <option value="">Domains: any</option>
+    <option value="1" {% if has_domain == '1' %}selected{% endif %}>Has domain</option>
+    <option value="0" {% if has_domain == '0' %}selected{% endif %}>No domain</option>
+  </select>
+  <select name="sort">
+    <option value="risk" {% if sort == 'risk' %}selected{% endif %}>Sort: risk</option>
+    <option value="added" {% if sort == 'added' %}selected{% endif %}>Sort: added (new first)</option>
+    <option value="added_asc" {% if sort == 'added_asc' %}selected{% endif %}>Sort: added (old first)</option>
+    <option value="seen" {% if sort == 'seen' %}selected{% endif %}>Sort: last seen</option>
+    <option value="seen_asc" {% if sort == 'seen_asc' %}selected{% endif %}>Sort: last seen ↑</option>
+    <option value="findings" {% if sort == 'findings' %}selected{% endif %}>Sort: findings</option>
+    <option value="ip" {% if sort == 'ip' %}selected{% endif %}>Sort: IP</option>
+  </select>
+  <button type="submit">Filter</button>
+  {% if query or service or risk or country or has_domain or (sort and sort != 'risk') %}
+  <a class="reset" href="{{ url_for('index') }}">Reset</a>
+  {% endif %}
+</form>
+
+<div class="table-wrap">
+  <table class="hosts">
+    <thead>
+      <tr>
+        <th>IP</th>
+        <th>Risk</th>
+        <th>Location</th>
+        <th>Services</th>
+        <th>Ports</th>
+        <th>Findings</th>
+        <th>Domains</th>
+        <th>Added</th>
+        <th>Last seen</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for h in hosts %}
+      <tr>
+        <td>
+          <a class="ip" href="{{ url_for('host_detail', host_id=h.id) }}">{{ h.ip }}</a>
+        </td>
+        <td>
+          <span class="badge risk-{{ h.risk_score | risk_class }}">{{ h.risk_score }}</span>
+        </td>
+        <td class="muted">
+          {% if h.city or h.country %}
+            {{ h.city or '' }}{% if h.city and h.country %}, {% endif %}{{ h.country or '' }}
+            {% if h.asn %}<br><span class="mono" style="font-size:11px">{{ h.asn }}</span>{% endif %}
+          {% else %}—{% endif %}
+        </td>
+        <td>
+          {% for s in h.services[:6] %}
+            <span class="tag service">{{ s }}</span>
+          {% else %}
+            <span class="muted">—</span>
+          {% endfor %}
+          {% if h.services|length > 6 %}
+            <span class="tag">+{{ h.services|length - 6 }}</span>
+          {% endif %}
+        </td>
+        <td class="mono">{{ h.service_count }}</td>
+        <td class="mono {% if h.finding_count %}sev-high{% endif %}">{{ h.finding_count }}</td>
+        <td>
+          {% if h.domains_preview %}
+            <span class="mono" style="font-size:12px" title="{{ h.domains_preview }}">
+              {{ h.domains_preview | truncate(40) }}
+            </span>
+            {% if h.domain_count > 3 %}
+              <span class="tag">+{{ h.domain_count - 3 }}</span>
+            {% endif %}
+          {% else %}
+            <span class="muted">—</span>
+          {% endif %}
+        </td>
+        <td class="muted mono" style="font-size:12px">{{ h.first_seen | short_time }}</td>
+        <td class="muted mono" style="font-size:12px">{{ h.last_seen | short_time }}</td>
+      </tr>
+      {% else %}
+      <tr>
+        <td colspan="9" class="empty" style="padding:24px;text-align:center">
+          Нет хостов{% if query or service or risk %} по фильтрам{% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endblock %}

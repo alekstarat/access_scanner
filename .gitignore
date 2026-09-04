@@ -3,3 +3,5 @@ wordlists
 .idea
 logs
 .venv
+/active_hosts.txt
+/example_ctx.txt

@@ -1,0 +1,118 @@
+{% extends "base.html" %}
+{% block title %}Tasks · Access Scanner{% endblock %}
+
+{% block topbar %}
+<h1>
+  <a href="{{ url_for('index') }}" style="color:var(--muted);text-decoration:none;margin-right:8px">←</a>
+  Task queue
+</h1>
+<div class="stats" style="margin-left:auto">
+  <span class="task-stat running"><b>{{ tstats.running }}</b> running</span>
+  <span class="task-stat pending"><b>{{ tstats.pending }}</b> pending</span>
+  <span><b>{{ tstats.done }}</b> done</span>
+  <span class="{% if tstats.error %}sev-high{% endif %}"><b>{{ tstats.error }}</b> error</span>
+  <a href="{{ url_for('api_tasks') }}" style="color:var(--muted);font-size:12px" target="_blank">JSON</a>
+</div>
+{% endblock %}
+
+{% block content %}
+<form class="filters" method="get" action="{{ url_for('tasks_page') }}">
+  <select name="status" onchange="this.form.submit()">
+    <option value="" {% if not status_filter %}selected{% endif %}>Active + recent</option>
+    <option value="running" {% if status_filter == 'running' %}selected{% endif %}>Running only</option>
+    <option value="pending" {% if status_filter == 'pending' %}selected{% endif %}>Pending only</option>
+    <option value="done" {% if status_filter == 'done' %}selected{% endif %}>Done</option>
+    <option value="error" {% if status_filter == 'error' %}selected{% endif %}>Error</option>
+  </select>
+  <button type="submit">Refresh</button>
+  <span class="muted" style="font-size:12px;margin-left:8px">
+    auto-refresh 5s · {{ tasks | length }} shown
+  </span>
+</form>
+
+{% if tstats.running or tstats.pending %}
+<div class="summary-bar">
+  {% if tstats.running %}
+  <div class="summary-chip" style="border-color:#2a4a6a">
+    <b class="sev-info">{{ tstats.running }}</b> сейчас выполняются
+  </div>
+  {% endif %}
+  {% if tstats.pending %}
+  <div class="summary-chip" style="border-color:#4a3a1a">
+    <b class="sev-medium">{{ tstats.pending }}</b> в очереди
+  </div>
+  {% endif %}
+</div>
+{% endif %}
+
+<div class="table-wrap">
+  <table class="hosts tasks-table">
+    <thead>
+      <tr>
+        <th>Status</th>
+        <th>Chain</th>
+        <th>Host</th>
+        <th>Service</th>
+        <th>Port</th>
+        <th>Priority</th>
+        <th>Created</th>
+        <th>Started</th>
+        <th>Finished</th>
+        <th>Error / note</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for t in tasks %}
+      <tr class="task-row status-{{ t.status }}">
+        <td>
+          <span class="status {{ t.status }}">{{ t.status }}</span>
+        </td>
+        <td class="mono" style="font-weight:600;color:var(--accent2)">{{ t.chain }}</td>
+        <td>
+          <a class="ip" href="{{ url_for('host_detail', host_id=t.host_id) }}">{{ t.ip }}</a>
+        </td>
+        <td>
+          {% if t.service %}
+          <span class="tag service">{{ t.service }}</span>
+          {% else %}
+          <span class="muted">—</span>
+          {% endif %}
+        </td>
+        <td class="mono">{{ t.port }}/{{ t.protocol }}</td>
+        <td class="mono muted">{{ t.priority }}</td>
+        <td class="mono muted" style="font-size:12px">{{ t.created_at | short_time }}</td>
+        <td class="mono muted" style="font-size:12px">{{ t.started_at | short_time if t.started_at else '—' }}</td>
+        <td class="mono muted" style="font-size:12px">{{ t.finished_at | short_time if t.finished_at else '—' }}</td>
+        <td class="muted" style="font-size:12px;max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
+            title="{{ t.error or '' }}">
+          {% if t.error %}
+            <span class="sev-high">{{ t.error | truncate(80) }}</span>
+          {% elif t.status == 'running' %}
+            <span class="sev-info">in progress…</span>
+          {% elif t.status == 'pending' %}
+            <span class="sev-medium">queued</span>
+          {% else %}
+            —
+          {% endif %}
+        </td>
+      </tr>
+      {% else %}
+      <tr>
+        <td colspan="10" class="empty" style="padding:24px;text-align:center">
+          Очередь пуста
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+// лёгкий auto-refresh, пока есть активные
+setTimeout(function() {
+  location.reload();
+}, 5000);
+</script>
+{% endblock %}
