@@ -30,10 +30,43 @@ try:
 except Exception:
     http_mod = None
 
-try:
-    from .html import _html as html_mod
-except Exception:
-    html_mod = None
+rtsp_mod = None
+_rtsp_import_error: Exception | None = None
+
+
+def _get_rtsp_module():
+    global rtsp_mod, _rtsp_import_error
+
+    if rtsp_mod is not None:
+        return rtsp_mod
+
+    try:
+        from .rtsp import rtsp_check as module
+        rtsp_mod = module
+        _rtsp_import_error = None
+        return module
+    except Exception as exc:
+        _rtsp_import_error = exc
+        return None
+
+html_mod = None
+_html_import_error: Exception | None = None
+
+
+def _get_html_module():
+    global html_mod, _html_import_error
+
+    if html_mod is not None:
+        return html_mod
+
+    try:
+        from .html import _html as module
+        html_mod = module
+        _html_import_error = None
+        return module
+    except Exception as exc:
+        _html_import_error = exc
+        return None
 
 
 SERVICE_CHAINS: dict[str, list[str]] = {
@@ -49,6 +82,7 @@ SERVICE_CHAINS: dict[str, list[str]] = {
     "telnet":   ["telnet_info"],
     "dns":      ["dns_info"],
     "pop3":     ["pop3_info"],
+    "rtsp":     ["rtsp_info"],
 }
 
 
@@ -157,14 +191,10 @@ def _http_dirs(ctx: dict) -> dict:
 
 def _https_dirs(ctx: dict) -> dict:
     if http_mod is not None and hasattr(http_mod, "search_dirs_by_domain"):
-        return http_mod.search_dirs(
-            ip=ctx.get("ip"),
-            port=ctx.get("port"),
-            service=ctx.get("service")
-        )
+        return http_mod.search_dirs_by_domain(ctx)
     return {
         "status": "stub",
-        "note": "http module / search_dirs not available",
+        "note": "http module / search_dirs_by_domain not available",
         "ip": ctx.get("ip"),
         "port": ctx.get("port"),
     }
@@ -183,15 +213,45 @@ def _http_headers(ctx: dict) -> dict:
 
 
 def _html_info(ctx: dict) -> dict:
-    if html_mod is not None and hasattr(html_mod, "run"):
-        try:
-            return html_mod.run(ctx)
-        except Exception as exc:
-            return {"error": str(exc)}
-    return {
-        "status": "stub",
-        "note": "html analysis module not ready",
-    }
+    """Запустить полноценный HTML-анализ.
+
+    Импорт выполняется в момент запуска цепочки, а не только при импорте
+    registry. Поэтому временная ошибка импорта/порядка загрузки больше не
+    приводит к вечному ``stub``-состоянию.
+    """
+    module = _get_html_module()
+    if module is None:
+        exc = _html_import_error
+        return {
+            "ok": False,
+            "error": "html analysis module unavailable",
+            "error_type": type(exc).__name__ if exc else None,
+            "details": str(exc) if exc else "unknown import error",
+        }
+
+    run = getattr(module, "run", None)
+    if not callable(run):
+        return {
+            "ok": False,
+            "error": "html analysis module has no callable run()",
+        }
+
+    try:
+        result = run(ctx)
+        if isinstance(result, dict):
+            return result
+        return {
+            "ok": False,
+            "error": "html analysis returned non-dict result",
+            "result_type": type(result).__name__,
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": "html analysis failed",
+            "error_type": type(exc).__name__,
+            "details": str(exc),
+        }
 
 
 def _tls_security(ctx: dict) -> dict:
@@ -241,6 +301,29 @@ def _pop3_info(ctx: dict) -> dict:
     return _generic_info(ctx) | {"note": "pop3 deep chain stub"}
 
 
+def _rtsp_info(ctx: dict) -> dict:
+    """Анонимный RTSP DESCRIBE: баннер + проверка auth."""
+    module = _get_rtsp_module()
+    if module is None:
+        exc = _rtsp_import_error
+        return {
+            "ok": False,
+            "error": "rtsp analysis module unavailable",
+            "error_type": type(exc).__name__ if exc else None,
+            "details": str(exc) if exc else "unknown import error",
+        }
+    run = getattr(module, "run", None)
+    if not callable(run):
+        return {"ok": False, "error": "rtsp module has no callable run()"}
+    try:
+        result = run(ctx)
+        if isinstance(result, dict):
+            return result
+        return {"ok": False, "error": "rtsp returned non-dict", "result_type": type(result).__name__}
+    except Exception as exc:
+        return {"ok": False, "error": "rtsp check failed", "error_type": type(exc).__name__, "details": str(exc)}
+
+
 # ── Registry ──────────────────────────────────────────────────
 
 _HANDLERS: dict[str, Callable[[dict], dict]] = {
@@ -260,6 +343,7 @@ _HANDLERS: dict[str, Callable[[dict], dict]] = {
     "telnet_info":    _telnet_info,
     "dns_info":       _dns_info,
     "pop3_info":      _pop3_info,
+    "rtsp_info":      _rtsp_info,
 }
 
 

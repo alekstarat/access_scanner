@@ -20,7 +20,7 @@ SENSITIVE_PORTS = {
 def calculate_host_score(conn, host_id: int) -> int:
     rows = conn.execute(
         """
-        SELECT finding_key, severity
+        SELECT observation_id, finding_key, severity
         FROM findings
         WHERE host_id = ?
         """,
@@ -28,14 +28,22 @@ def calculate_host_score(conn, host_id: int) -> int:
     ).fetchall()
 
     points = 0
+    # Дедуп — в разрезе (observation_id, finding_key):
+    # один и тот же finding на разных портах/сервисах считается многократно,
+    # повтор той же находки на том же наблюдении — один раз.
     seen = set()
 
     for row in rows:
-        finding_key = row["finding_key"] if hasattr(row, "keys") else row[0]
-        severity = row["severity"] if hasattr(row, "keys") else row[1]
-        if finding_key in seen:
+        if hasattr(row, "keys"):
+            obs_id = row["observation_id"]
+            finding_key = row["finding_key"]
+            severity = row["severity"]
+        else:
+            obs_id, finding_key, severity = row[0], row[1], row[2]
+        dedup_key = (obs_id, finding_key)
+        if dedup_key in seen:
             continue
-        seen.add(finding_key)
+        seen.add(dedup_key)
         points += SEVERITY_POINTS.get(severity, 0)
 
     ports = conn.execute(

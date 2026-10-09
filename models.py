@@ -278,7 +278,8 @@ def _load_services(conn, host_id: int) -> list[Service]:
                 try:
                     value = json.loads(r["value_json"])
                 except Exception:
-                    value = r["value_json"]
+                    # Битый value_json не должен ронять всю страницу хоста.
+                    value = {"_raw": str(r["value_json"])[:2000], "_parse_error": True}
                 dr = DeepResult(
                     key=r["key"],
                     value=value,
@@ -287,12 +288,15 @@ def _load_services(conn, host_id: int) -> list[Service]:
                     chain=t["chain"],
                 )
                 results.append(dr)
-                # агрегируем удобный доступ: deep[chain][key] = value
-                # и deep[key] = value (последний побеждает)
+                # агрегируем удобный доступ: deep[chain][key] = value.
+                # Плоские ключи складываем в отдельный неймспейс deep["values"],
+                # чтобы не коллидировать с именами цепочек.
                 chain_bucket = deep_agg.setdefault(t["chain"], {})
                 if isinstance(chain_bucket, dict):
                     chain_bucket[r["key"]] = value
-                deep_agg[r["key"]] = value
+                values_bucket = deep_agg.setdefault("values", {})
+                if isinstance(values_bucket, dict):
+                    values_bucket[r["key"]] = value
 
             deep_tasks.append(
                 DeepTask(

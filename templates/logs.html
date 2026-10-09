@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block title %}Logs · Access Scanner{% endblock %}
+{% block topbar %}
+<h1><a href="{{ url_for('tasks_page') }}" style="color:var(--muted);text-decoration:none;margin-right:8px">←</a> Task logs</h1>
+{% endblock %}
+{% block content %}
+<div style="display:grid;grid-template-columns:300px 1fr;gap:16px;min-height:70vh">
+  <div class="table-wrap" style="max-height:70vh;overflow:auto">
+    <table class="hosts"><tbody>
+      {% for t in tasks %}
+      <tr class="{% if selected and t.task_id == selected.id %}active{% endif %}">
+        <td><a href="{{ url_for('logs_page', task_id=t.task_id) }}"><span class="status {{ t.status }}">{{ t.status }}</span> <span class="mono">#{{ t.task_id }}</span></a><br><span class="muted">{{ t.chain }} · {{ t.ip }}:{{ t.port }}</span></td>
+      </tr>
+      {% endfor %}
+    </tbody></table>
+  </div>
+  <div>
+    {% if selected %}
+    <div class="summary-bar"><div class="summary-chip"><b>#{{ selected.id }}</b> {{ selected.chain }} · {{ selected.status }}</div></div>
+    <pre id="task-log" style="height:65vh;overflow:auto;background:#0b0e12;border:1px solid var(--border);padding:14px;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap">{{ log_text }}</pre>
+    {% else %}<div class="empty">Нет логов</div>{% endif %}
+  </div>
+</div>
+{% endblock %}
+{% block scripts %}
+{% if selected %}<script>
+const el=document.getElementById('task-log');
+async function refreshLog(){ const r=await fetch('{{ url_for('api_task_log', task_id=selected.id) }}'); if(r.ok){ const d=await r.json(); el.textContent=d.text||''; el.scrollTop=el.scrollHeight; } }
+refreshLog(); setInterval(refreshLog, 1500);
+</script>{% endif %}
+{% endblock %}

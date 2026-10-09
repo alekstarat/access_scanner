@@ -1,4 +1,5 @@
 import importlib
+import socket
 from database import init_db, save_result
 from risk_engine import update_host_score, risk_level
 from scanners.common import result
@@ -50,15 +51,68 @@ def load_module(port, proto):
         return None
 
 
+def generic_banner_probe(ip, port, proto):
+    """Fallback для неизвестных портов: banner-grab вместо пустого unknown."""
+    from scanners.common import finding as _finding, result as _result
+    if proto != "tcp":
+        return _result(
+            service="unknown",
+            port=port,
+            protocol=proto,
+            findings=[_finding("unsupported_protocol", 0, "Generic probe expects TCP")],
+        )
+    try:
+        with socket.create_connection((ip, port), timeout=3) as sock:
+            sock.settimeout(2)
+            try:
+                data = sock.recv(1024)
+            except socket.timeout:
+                data = b""
+        observations = {}
+        findings = []
+        if data:
+            banner = data.decode(errors="replace").strip()[:500]
+            observations["banner"] = banner
+            observations["response_size"] = len(data)
+            findings.append(
+                _finding(
+                    "unknown_service_banner",
+                    1,
+                    "Unknown service responded with banner",
+                    evidence=banner[:200],
+                )
+            )
+        else:
+            findings.append(
+                _finding(
+                    "unknown_open_no_banner",
+                    1,
+                    "Unknown port open, no banner",
+                )
+            )
+        return _result(
+            service="unknown",
+            port=port,
+            protocol=proto,
+            observations=observations,
+            findings=findings,
+        )
+    except Exception as exc:
+        return _result(
+            service="unknown",
+            port=port,
+            protocol=proto,
+            findings=[
+                _finding("unknown_probe_error", 0, "Generic probe failed", evidence=str(exc))
+            ],
+        )
+
+
 def run_module(ip, port, proto):
     module = load_module(port, proto)
 
     if module is None:
-        return result(
-            service="unknown",
-            port=port,
-            protocol=proto,
-        )
+        return generic_banner_probe(ip, port, proto)
 
     if not hasattr(module, "run"):
         raise RuntimeError(f"Module {module.__name__} has no run()")

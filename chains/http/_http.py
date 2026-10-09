@@ -19,6 +19,18 @@ from deep_runner import run_bash, DEEP_TIMEOUT
 log = logging.getLogger(__name__)
 
 SCRIPT = Path(__file__).resolve().parent / "search_dirs.sh"
+
+
+def _ffuf_timeout() -> int:
+    """Актуальный лимит ffuf: min(180, текущий DEEP_TIMEOUT)."""
+    try:
+        from deep_runner import get_timeout
+        return min(180, int(get_timeout()))
+    except Exception:
+        return min(180, DEEP_TIMEOUT)
+
+
+# Backward-compat: старое имя константы (заморожена на импорте — не использовать).
 FFUF_TIMEOUT = min(180, DEEP_TIMEOUT)
 
 # сколько доменов максимум фузить за одну https_dirs задачу
@@ -97,7 +109,7 @@ def search_dirs(
         cmd.extend(["-H", str(host_header)])
 
     log.info("search_dirs: %s", " ".join(cmd))
-    result = run_bash(cmd, timeout=FFUF_TIMEOUT)
+    result = run_bash(cmd, timeout=_ffuf_timeout())
 
     parsed = _parse_ffuf_stdout(result.get("stdout") or "")
 

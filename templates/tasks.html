@@ -23,6 +23,7 @@
     <option value="pending" {% if status_filter == 'pending' %}selected{% endif %}>Pending only</option>
     <option value="done" {% if status_filter == 'done' %}selected{% endif %}>Done</option>
     <option value="error" {% if status_filter == 'error' %}selected{% endif %}>Error</option>
+    <option value="cancelled" {% if status_filter == 'cancelled' %}selected{% endif %}>Cancelled</option>
   </select>
   <button type="submit">Refresh</button>
   <span class="muted" style="font-size:12px;margin-left:8px">
@@ -59,6 +60,7 @@
         <th>Started</th>
         <th>Finished</th>
         <th>Error / note</th>
+        <th>Actions</th>
       </tr>
     </thead>
     <tbody>
@@ -95,10 +97,18 @@
             —
           {% endif %}
         </td>
+        <td class="actions" style="white-space:nowrap">
+          <a class="tag" href="{{ url_for('logs_page', task_id=t.task_id) }}">log</a>
+          {% if t.status == 'running' %}
+          <button type="button" class="task-stop" data-id="{{ t.task_id }}">Stop</button>
+          {% elif t.status in ('pending', 'done', 'error', 'cancelled') %}
+          <button type="button" class="task-start" data-id="{{ t.task_id }}">{% if t.status == 'pending' %}Start{% else %}Restart{% endif %}</button>
+          {% endif %}
+        </td>
       </tr>
       {% else %}
       <tr>
-        <td colspan="10" class="empty" style="padding:24px;text-align:center">
+        <td colspan="11" class="empty" style="padding:24px;text-align:center">
           Очередь пуста
         </td>
       </tr>
@@ -110,9 +120,13 @@
 
 {% block scripts %}
 <script>
-// лёгкий auto-refresh, пока есть активные
-setTimeout(function() {
+async function taskAction(id, action) {
+  const r = await fetch(`/api/tasks/${id}/${action}`, {method: 'POST', headers: {'Content-Type':'application/json'}});
+  if (!r.ok) { alert(await r.text()); return; }
   location.reload();
-}, 5000);
+}
+document.querySelectorAll('.task-stop').forEach(b => b.onclick = () => taskAction(b.dataset.id, 'stop'));
+document.querySelectorAll('.task-start').forEach(b => b.onclick = () => taskAction(b.dataset.id, 'start'));
+setTimeout(() => location.reload(), 3000);
 </script>
 {% endblock %}

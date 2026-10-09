@@ -3,8 +3,12 @@ import concurrent.futures
 import json
 import os
 import time
+import threading
+import uuid
 from pathlib import Path
 import ipaddress
+import signal
+import atexit
 
 from main import run_module, format_result
 from database import (
@@ -21,6 +25,10 @@ from database import (
     fetch_pending_deep,
     mark_deep_running,
     mark_deep_done,
+    mark_deep_cancelled,
+    heartbeat_deep,
+    recover_interrupted_deep,
+    deep_cancel_requested,
     save_deep_result,
     utcnow,
 )
@@ -35,10 +43,80 @@ import deep_runner
 QUEUE_FILE = Path("active_hosts.txt")
 OFFSET_FILE = Path("state/worker.offset")
 POLL_INTERVAL = 1.0
+WORKER_ID = f"worker-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+TASK_STALE_AFTER = int(os.environ.get("TASK_STALE_AFTER", "30"))
+WORKER_PID_FILE = Path("state/worker.pid")
+WORKER_STATUS_FILE = Path("state/worker.json")
+WORKER_LOG_FILE = Path("state/worker.log")
+STOP_EVENT = threading.Event()
 
 
 def log(message: str):
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}", flush=True)
+
+
+def _write_worker_status(state="running", extra=None):
+    import json as _json
+    import tempfile
+    WORKER_STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "state": state, "pid": os.getpid(), "worker_id": WORKER_ID,
+        "updated_at": utcnow(), "queue_file": str(QUEUE_FILE),
+        "deep": deep_runner.stats(),
+    }
+    if extra:
+        payload.update(extra)
+    text = _json.dumps(payload, ensure_ascii=False, indent=2)
+    # Уникальный tmp на запись — тот же фикс гонки, что в deep_runner._write_runtime.
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(WORKER_STATUS_FILE.parent),
+        prefix=WORKER_STATUS_FILE.stem + ".",
+        suffix=".tmp",
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp_name, WORKER_STATUS_FILE)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+
+
+def _cleanup_worker_files():
+    try:
+        if WORKER_PID_FILE.exists() and WORKER_PID_FILE.read_text().strip() == str(os.getpid()):
+            WORKER_PID_FILE.unlink()
+    except OSError:
+        pass
+    try:
+        _write_worker_status("stopped")
+    except Exception:
+        pass
+
+
+def _handle_signal(signum, _frame):
+    log(f"[*] Shutdown signal {signum} received")
+    STOP_EVENT.set()
+
+
+def _install_worker_lifecycle():
+    WORKER_PID_FILE.parent.mkdir(parents=True, exist_ok=True)
+    if WORKER_PID_FILE.exists():
+        try:
+            old_pid = int(WORKER_PID_FILE.read_text().strip())
+            os.kill(old_pid, 0)
+            raise RuntimeError(f"worker already running (pid={old_pid})")
+        except ProcessLookupError:
+            pass
+        except ValueError:
+            pass
+    WORKER_PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
+    atexit.register(_cleanup_worker_files)
+    _write_worker_status("running")
 
 
 def valid_ip(value: str) -> bool:
@@ -177,7 +255,7 @@ def process_host(ip: str, ports: list):
 
             tls_info, tls_findings = {}, []
             service = (data.get("service") or "").lower()
-            if service == "https" or (proto == "tcp" and port in (443, 8443, 9443)):
+            if service == "https" or (proto == "tcp" and port in (443, 4443, 8443, 9443)):
                 tls_info, tls_findings = fetch_tls(ip, port)
                 for name in tls_info.get("domains") or []:
                     log(f"    domain (cert): {name}")
@@ -296,6 +374,7 @@ def _run_one_deep(task: dict) -> tuple[int, int, str, dict | None, str | None]:
     obs_id = task["observation_id"]
     chain = task["chain"]
     ctx = task.get("_ctx")
+    deep_runner.set_task_context(task_id)
 
     if ctx is None:
         return task_id, obs_id, chain, None, "observation not found / no ctx"
@@ -312,108 +391,83 @@ def _run_one_deep(task: dict) -> tuple[int, int, str, dict | None, str | None]:
     except Exception as exc:
         log(f"    deep exception: {chain} (obs={obs_id}): {exc}")
         return task_id, obs_id, chain, None, str(exc)
+    finally:
+        deep_runner.set_task_context(None)
+
+
+def _heartbeat(task_id: int, stop_event: threading.Event):
+    while not stop_event.wait(5):
+        try:
+            with connect() as conn:
+                heartbeat_deep(conn, task_id, WORKER_ID)
+        except Exception as exc:
+            log(f"[!] heartbeat failed task={task_id}: {exc}")
 
 
 def run_pending_deep(limit: int | None = None):
-    """
-    Забирает pending deep-задачи, готовит ctx под DB-локом,
-    запускает в deep_runner pool (лимит workers + bash_limit),
-    сохраняет результаты.
-    """
     if limit is None:
         limit = deep_runner.DEEP_BATCH
 
     deep_runner.start()
-
+    prepared = []
     with connect() as conn:
-        tasks = [dict(t) for t in fetch_pending_deep(conn, limit=limit)]
-
-        if not tasks:
-            return
-
-        prepared = []
-        for task in tasks:
+        candidates = [dict(t) for t in fetch_pending_deep(conn, limit=limit)]
+        for task in candidates:
             task_id = task["id"]
-            obs_id = task["observation_id"]
-            chain = task["chain"]
-
             try:
-                mark_deep_running(conn, task_id)
-                ctx = _build_ctx(conn, obs_id)
+                if not mark_deep_running(conn, task_id, WORKER_ID):
+                    continue
+                ctx = _build_ctx(conn, task["observation_id"])
                 if ctx is None:
                     mark_deep_done(conn, task_id, error="observation not found")
                     continue
                 task["_ctx"] = ctx
                 prepared.append(task)
             except Exception as exc:
-                try:
-                    mark_deep_done(conn, task_id, error=str(exc))
-                except Exception:
-                    pass
-                log(f"    deep prepare fail: {chain}: {exc}")
+                try: mark_deep_done(conn, task_id, error=str(exc))
+                except Exception: pass
+                log(f"    deep prepare fail: {task.get('chain')}: {exc}")
 
     if not prepared:
         return
 
     cfg = deep_runner.stats()
-    log(
-        f"[*] Running {len(prepared)} deep task(s) "
-        f"(workers={cfg['workers']}, bash_limit={cfg['bash_limit']}, "
-        f"timeout={cfg['timeout']}s)"
-    )
-
-    futures = {
-        deep_runner.submit(_run_one_deep, task): task
-        for task in prepared
-    }
+    log(f"[*] Running {len(prepared)} deep task(s) (workers={cfg['workers']}, bash_limit={cfg['bash_limit']}, timeout={cfg['timeout']}s)")
+    futures = {deep_runner.submit(_run_one_deep, task): task for task in prepared}
+    heartbeat_stops = {task["id"]: threading.Event() for task in prepared}
+    heartbeat_threads = {}
+    for task in prepared:
+        th = threading.Thread(target=_heartbeat, args=(task["id"], heartbeat_stops[task["id"]]), daemon=True)
+        heartbeat_threads[task["id"]] = th
+        th.start()
 
     for future in concurrent.futures.as_completed(futures):
         task = futures[future]
-        task_id = task["id"]
-        obs_id = task["observation_id"]
-        chain = task["chain"]
-        # Страховка: если handler завис без run_bash — future timeout.
-        # Для run_bash kill сработает раньше, внутри.
-        timeout = deep_runner.DEEP_TIMEOUT + 15
-
+        task_id, obs_id, chain = task["id"], task["observation_id"], task["chain"]
+        heartbeat_stops[task_id].set()
         try:
-            task_id, obs_id, chain, result, error = future.result(timeout=timeout)
-
+            _, _, _, result, error = future.result()
             with connect() as conn:
-                if error:
+                cancelled = deep_cancel_requested(conn, task_id)
+                if cancelled or error == "cancelled":
+                    mark_deep_cancelled(conn, task_id)
+                    log(f"    deep cancelled: {chain} (obs={obs_id})")
+                elif error:
                     mark_deep_done(conn, task_id, error=error)
                     log(f"    deep fail: {chain} (obs={obs_id}): {error}")
                 else:
                     save_deep_result(conn, task_id, obs_id, chain, result)
                     if isinstance(result, dict):
                         for k, v in result.items():
-                            if k == chain:
-                                continue
-                            try:
-                                save_deep_result(conn, task_id, obs_id, str(k), v)
-                            except Exception:
-                                pass
+                            if k == chain: continue
+                            try: save_deep_result(conn, task_id, obs_id, str(k), v)
+                            except Exception: pass
                     mark_deep_done(conn, task_id)
                     log(f"    deep ok: {chain} (obs={obs_id})")
-
-        except concurrent.futures.TimeoutError:
-            try:
-                with connect() as conn:
-                    mark_deep_done(
-                        conn, task_id,
-                        error=f"timeout after {deep_runner.DEEP_TIMEOUT}s",
-                    )
-            except Exception:
-                pass
-            log(f"    deep timeout: {chain} (obs={obs_id})")
-
         except Exception as exc:
-            try:
-                with connect() as conn:
-                    mark_deep_done(conn, task_id, error=str(exc))
-            except Exception:
-                pass
-            log(f"    deep fail: {chain} (obs={obs_id}): {exc}")
+            with connect() as conn:
+                mark_deep_done(conn, task_id, error=str(exc))
+            log(f"    deep future error: {chain} (obs={obs_id}): {exc}")
 
 
 def process_line(line: str):
@@ -436,8 +490,13 @@ def worker():
     OFFSET_FILE.parent.mkdir(parents=True, exist_ok=True)
     offset = load_offset()
 
+    with connect() as conn:
+        recovered = recover_interrupted_deep(conn, stale_after_seconds=TASK_STALE_AFTER)
+    if recovered:
+        log(f"[*] Requeued {recovered} interrupted deep task(s)")
+
     cfg = deep_runner.stats()
-    log("[*] Worker started")
+    log(f"[*] Worker started id={WORKER_ID}")
     log(f"[*] Queue: {QUEUE_FILE}")
     log(f"[*] Offset: {offset}")
     log(
@@ -446,10 +505,10 @@ def worker():
         f"batch={cfg['batch']}"
     )
 
-    while True:
+    while not STOP_EVENT.is_set():
         if not QUEUE_FILE.exists():
             run_pending_deep()
-            time.sleep(POLL_INTERVAL)
+            STOP_EVENT.wait(POLL_INTERVAL)
             continue
 
         try:
@@ -485,7 +544,10 @@ def worker():
             log(f"[!] Queue read error: {exc}")
 
         run_pending_deep()
-        time.sleep(POLL_INTERVAL)
+        _write_worker_status("running", {"queue_offset": offset})
+        STOP_EVENT.wait(POLL_INTERVAL)
+
+    log("[*] Worker stopped")
 
 
 def main():
@@ -521,6 +583,7 @@ def main():
         log("[*] Worker offset reset")
 
     init_db()
+    _install_worker_lifecycle()
     deep_runner.start()
     try:
         worker()

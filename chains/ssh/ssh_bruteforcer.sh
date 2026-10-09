@@ -9,10 +9,36 @@ fi
 TARGET="$1"
 USERS="$2"
 
-LOG_DIR="/home/arch/Desktop/git/access_scanner/logs"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+CONFIG_FILE="${ACCESS_SCANNER_CONFIG:-$PROJECT_ROOT/config.json}"
+config_value() {
+    python3 - "$CONFIG_FILE" "$1" <<'PYCFG'
+import json, sys
+from pathlib import Path
+cfg_path, key = sys.argv[1:3]
+try:
+    data = json.loads(Path(cfg_path).read_text(encoding="utf-8"))
+    value = data
+    for part in key.split("."):
+        value = value[part]
+    print(value)
+except Exception:
+    sys.exit(1)
+PYCFG
+}
+WORDLIST_REL="$(config_value paths.ssh_password_wordlist 2>/dev/null || echo wordlists/500p.txt)"
+MSF_BIN="$(config_value binaries.metasploit 2>/dev/null || echo msfconsole)"
+
+LOG_DIR="$PROJECT_ROOT/logs"
 LOG_FILE="${LOG_DIR}/ssh_scan_$(date +%Y%m%d_%H%M%S).log"
-ORIGINAL_PASS_FILE="/home/arch/Desktop/git/access_scanner/wordlists/500p.txt"
-RC_DIR="/home/arch/Desktop/git/access_scanner/rcs"
+if [[ "$WORDLIST_REL" = /* ]]; then
+    DEFAULT_PASS_FILE="$WORDLIST_REL"
+else
+    DEFAULT_PASS_FILE="$PROJECT_ROOT/$WORDLIST_REL"
+fi
+ORIGINAL_PASS_FILE="${SSH_PASSWORD_WORDLIST:-$DEFAULT_PASS_FILE}"
+RC_DIR="$PROJECT_ROOT/rcs"
 
 mkdir -p "$LOG_DIR"
 mkdir -p "$RC_DIR"
@@ -29,7 +55,7 @@ cleanup() {
 
 trap cleanup EXIT
 
-if ! command -v msfconsole &> /dev/null; then
+if ! command -v "$MSF_BIN" &> /dev/null; then
     echo "[-] Ошибка: msfconsole не найден." | tee -a "$LOG_FILE"
     exit 1
 fi
@@ -62,7 +88,7 @@ echo "[+] Запуск msfconsole для цели: $TARGET..."
 echo "[+] Пользователи: $USERS"
 echo "[+] Вывод дублируется в лог: $LOG_FILE"
 
-msfconsole -q -r "$RC_FILE" 2>&1 | tee -a "$LOG_FILE"
+$MSF_BIN -q -r "$RC_FILE" 2>&1 | tee -a "$LOG_FILE"
 
 MSF_EXIT_CODE=${PIPESTATUS[0]}
 

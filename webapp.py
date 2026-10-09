@@ -9,22 +9,91 @@ from __future__ import annotations
 
 import json
 import sys
+import os
+import signal
+import subprocess
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from flask import Flask, abort, render_template, request, jsonify
+from flask import Flask, abort, render_template, request, jsonify, redirect, url_for
 
-from database import connect, init_db
+from database import connect, init_db, request_deep_cancel, restart_deep, fetch_task_logs
 from models import get_host_by_id, list_host_summaries
+import deep_runner
 
 app = Flask(
     __name__,
     template_folder=str(ROOT / "templates"),
     static_folder=str(ROOT / "static"),
 )
+
+
+WORKER_PID_FILE = ROOT / "state" / "worker.pid"
+WORKER_STATUS_FILE = ROOT / "state" / "worker.json"
+WORKER_LOG_FILE = ROOT / "state" / "worker.log"
+
+
+def _worker_pid():
+    try:
+        pid = int(WORKER_PID_FILE.read_text().strip())
+        os.kill(pid, 0)
+        return pid
+    except (OSError, ValueError, FileNotFoundError):
+        return None
+
+
+def worker_status():
+    pid = _worker_pid()
+    status = {}
+    try:
+        status = json.loads(WORKER_STATUS_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        pass
+    status["running"] = bool(pid)
+    status["pid"] = pid
+    if not pid:
+        status["state"] = "stopped"
+    return status
+
+
+def _start_worker_process():
+    pid = _worker_pid()
+    if pid:
+        return False, f"worker already running (pid={pid})"
+    WORKER_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    log_handle = WORKER_LOG_FILE.open("a", encoding="utf-8")
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, str(ROOT / "worker.py")],
+            cwd=str(ROOT), stdout=log_handle, stderr=subprocess.STDOUT,
+            start_new_session=True, close_fds=True,
+        )
+    finally:
+        log_handle.close()
+    return True, f"worker started (pid={proc.pid})"
+
+
+def _stop_worker_process():
+    pid = _worker_pid()
+    if not pid:
+        return False, "worker is not running"
+    try:
+        os.kill(pid, signal.SIGTERM)
+        return True, f"shutdown requested (pid={pid})"
+    except OSError as exc:
+        return False, str(exc)
+
+
+def worker_log_tail(limit=100000):
+    try:
+        data = WORKER_LOG_FILE.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    return data[-limit:]
 
 SEVERITY_NAMES = {0: "INFO", 1: "LOW", 2: "MEDIUM", 3: "HIGH", 4: "CRITICAL"}
 SEVERITY_CLASS = {0: "info", 1: "low", 2: "medium", 3: "high", 4: "critical"}
@@ -115,6 +184,10 @@ def fetch_task_queue(conn, status=None, limit=200):
             dt.started_at,
             dt.finished_at,
             dt.error,
+            dt.worker_id,
+            dt.heartbeat_at,
+            dt.cancel_requested,
+            dt.attempt,
             so.id AS observation_id,
             so.port,
             so.protocol,
@@ -157,6 +230,58 @@ def task_queue_stats(conn):
         stats["total"] += r["cnt"]
     stats["active"] = stats.get("pending", 0) + stats.get("running", 0)
     return stats
+
+
+@app.route("/dashboard")
+def dashboard_page():
+    with connect() as conn:
+        tstats = task_queue_stats(conn)
+        host_count = conn.execute("SELECT COUNT(*) FROM hosts").fetchone()[0]
+        scan_count = conn.execute("SELECT COUNT(*) FROM scans").fetchone()[0]
+    status = worker_status()
+    runtime = {}
+    try:
+        runtime = json.loads((ROOT / "state" / "deep_runtime.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        runtime = {"processes": [], "active_count": 0}
+    status["runtime"] = runtime
+    status["free_slots"] = max(0, int(status.get("deep", {}).get("workers", 0)) - int(tstats.get("running", 0)))
+    return render_template("dashboard.html", status=status, tstats=tstats, host_count=host_count, scan_count=scan_count, worker_log=worker_log_tail(50000))
+
+
+@app.post("/api/worker/start")
+def api_worker_start():
+    ok, message = _start_worker_process()
+    return jsonify({"ok": ok, "message": message, "status": worker_status()}), (200 if ok else 409)
+
+
+@app.post("/api/worker/stop")
+def api_worker_stop():
+    ok, message = _stop_worker_process()
+    return jsonify({"ok": ok, "message": message, "status": worker_status()}), (200 if ok else 409)
+
+
+@app.get("/api/worker")
+def api_worker():
+    status = worker_status()
+    try:
+        status["runtime"] = json.loads((ROOT / "state" / "deep_runtime.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        status["runtime"] = {"processes": [], "active_count": 0}
+    with connect() as conn:
+        stats = task_queue_stats(conn)
+    status["queue"] = stats
+    status["free_slots"] = max(0, int(status.get("deep", {}).get("workers", 0)) - int(stats.get("running", 0)))
+    return jsonify(status)
+
+
+@app.get("/api/worker/log")
+def api_worker_log():
+    try:
+        limit = int(request.args.get("limit", 100000))
+    except (TypeError, ValueError):
+        limit = 100000
+    return jsonify({"text": worker_log_tail(min(max(limit, 1), 300000))})
 
 
 @app.route("/")
@@ -377,9 +502,15 @@ def api_host(host_id):
 @app.route("/api/hosts")
 def api_hosts():
     """JSON API — список саммари."""
-    limit = min(int(request.args.get("limit", 100)), 500)
-    offset = int(request.args.get("offset", 0))
-    return jsonify(list_host_summaries(limit=limit, offset=offset))
+    try:
+        limit = int(request.args.get("limit", 100))
+    except (TypeError, ValueError):
+        limit = 100
+    try:
+        offset = int(request.args.get("offset", 0))
+    except (TypeError, ValueError):
+        offset = 0
+    return jsonify(list_host_summaries(limit=min(max(limit, 1), 500), offset=max(offset, 0)))
 
 
 @app.route("/tasks")
@@ -388,12 +519,12 @@ def tasks_page():
     status_filter = request.args.get("status", "").strip().lower()
     with connect() as conn:
         tstats = task_queue_stats(conn)
-        if status_filter in ("pending", "running", "done", "error"):
+        if status_filter in ("pending", "running", "done", "error", "cancelled"):
             queue = fetch_task_queue(conn, status=status_filter, limit=300)
         else:
             # активные всегда + последние завершённые
             active = fetch_task_queue(conn, status=["pending", "running"], limit=200)
-            recent = fetch_task_queue(conn, status=["done", "error"], limit=50)
+            recent = fetch_task_queue(conn, status=["done", "error", "cancelled"], limit=50)
             # recent already ordered; re-sort done/error by finished
             recent.sort(
                 key=lambda t: t.get("finished_at") or t.get("created_at") or "",
@@ -425,16 +556,101 @@ def tasks_page():
 def api_tasks():
     """JSON: очередь задач."""
     status_filter = request.args.get("status", "").strip().lower()
-    limit = min(int(request.args.get("limit", 200)), 500)
+    try:
+        limit = int(request.args.get("limit", 200))
+    except (TypeError, ValueError):
+        limit = 200
+    limit = min(max(limit, 1), 500)
     with connect() as conn:
         tstats = task_queue_stats(conn)
-        if status_filter in ("pending", "running", "done", "error"):
+        if status_filter in ("pending", "running", "done", "error", "cancelled"):
             queue = fetch_task_queue(conn, status=status_filter, limit=limit)
         else:
             queue = fetch_task_queue(
-                conn, status=["pending", "running", "done", "error"], limit=limit
+                conn, status=["pending", "running", "done", "error", "cancelled"], limit=limit
             )
     return jsonify({"stats": tstats, "tasks": queue})
+
+
+@app.post("/api/tasks/<int:task_id>/stop")
+def api_task_stop(task_id):
+    with connect() as conn:
+        row = conn.execute("SELECT id, status FROM deep_tasks WHERE id = ?", (task_id,)).fetchone()
+        if not row:
+            return jsonify({"ok": False, "error": "task not found"}), 404
+        changed = request_deep_cancel(conn, task_id)
+    if changed and row["status"] == "running":
+        deep_runner.request_cancel_marker(task_id)
+    return jsonify({"ok": True, "status": "cancelling" if row["status"] == "running" else "cancelled"})
+
+
+@app.post("/api/tasks/<int:task_id>/start")
+def api_task_start(task_id):
+    with connect() as conn:
+        row = conn.execute("SELECT id, status FROM deep_tasks WHERE id = ?", (task_id,)).fetchone()
+        if not row:
+            return jsonify({"ok": False, "error": "task not found"}), 404
+        if row["status"] == "running":
+            return jsonify({"ok": True, "status": "running"})
+        if row["status"] == "pending":
+            return jsonify({"ok": True, "status": "pending"})
+        if not restart_deep(conn, task_id):
+            return jsonify({"ok": False, "error": "task cannot be started from this state"}), 409
+    deep_runner.clear_cancel_marker(task_id)
+    return jsonify({"ok": True, "status": "pending"})
+
+
+@app.get("/api/tasks/<int:task_id>")
+def api_task(task_id):
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM deep_tasks WHERE id = ?", (task_id,)).fetchone()
+        if not row:
+            return jsonify({"ok": False, "error": "task not found"}), 404
+        task = dict(row)
+        obs = conn.execute("""
+            SELECT so.port, so.protocol, so.service, h.ip, h.id AS host_id
+            FROM service_observations so JOIN hosts h ON h.id=so.host_id
+            WHERE so.id=?
+        """, (task["observation_id"],)).fetchone()
+        task.update(dict(obs) if obs else {})
+    task["log"] = deep_runner.task_log_tail(task_id)
+    return jsonify(task)
+
+
+@app.get("/api/tasks/<int:task_id>/log")
+def api_task_log(task_id):
+    try:
+        after = int(request.args.get("after", 0) or 0)
+    except (TypeError, ValueError):
+        after = 0
+    try:
+        limit = int(request.args.get("limit", 1000) or 1000)
+    except (TypeError, ValueError):
+        limit = 1000
+    limit = min(max(limit, 1), 5000)
+    after = max(after, 0)
+    with connect() as conn:
+        exists = conn.execute("SELECT 1 FROM deep_tasks WHERE id=?", (task_id,)).fetchone()
+        if not exists:
+            return jsonify({"ok": False, "error": "task not found"}), 404
+        rows = fetch_task_logs(conn, task_id, limit=limit, after_id=after)
+    # File logs are live/streamed; DB fallback is intentionally lightweight.
+    return jsonify({"ok": True, "task_id": task_id, "logs": rows, "text": deep_runner.task_log_tail(task_id)})
+
+
+@app.route("/logs")
+def logs_page():
+    task_id = request.args.get("task_id", type=int)
+    with connect() as conn:
+        tasks = fetch_task_queue(conn, status=["running", "pending", "done", "error", "cancelled"], limit=200)
+        if task_id:
+            selected = conn.execute("SELECT id, chain, status FROM deep_tasks WHERE id=?", (task_id,)).fetchone()
+            selected = dict(selected) if selected else None
+        else:
+            selected = tasks[0] if tasks else None
+    log_text = deep_runner.task_log_tail(task_id or (selected["id"] if selected else 0)) if (task_id or selected) else ""
+    return render_template("logs.html", tasks=tasks, selected=selected, log_text=log_text,
+                           nav_hosts=[])
 
 
 @app.route("/health")
@@ -446,8 +662,8 @@ def health():
 
 def main():
     init_db()
-    print("Open http://127.0.0.1:8088")
-    app.run(host="127.0.0.1", port=8088, debug=False)
+    print("Open http://127.0.0.1:8000")
+    app.run(host="127.0.0.1", port=8000, debug=False)
 
 
 if __name__ == "__main__":

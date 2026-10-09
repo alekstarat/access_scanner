@@ -48,6 +48,7 @@ def run(ip, port, proto):
             ],
         )
 
+    conn = None
     try:
         conn = http.client.HTTPConnection(
             ip,
@@ -149,21 +150,24 @@ def run(ip, port, proto):
                 )
             )
 
-        # Cookies.
+        # Cookies: атрибуты идут после первого ';' (name=value; Secure; HttpOnly...).
+        # Проверяем именно атрибуты, а не всю строку — значение куки может
+        # содержать подстроки вида "secure".
         cookies = response.headers.get_all("Set-Cookie") or []
 
         insecure_cookies = []
 
         for cookie in cookies:
-            lower = cookie.lower()
+            parts = (cookie or "").split(";")[1:]
+            attrs = {p.strip().lower().split("=", 1)[0] for p in parts}
 
-            if "secure" not in lower:
+            if "secure" not in attrs:
                 insecure_cookies.append("missing Secure")
 
-            if "httponly" not in lower:
+            if "httponly" not in attrs:
                 insecure_cookies.append("missing HttpOnly")
 
-            if "samesite" not in lower:
+            if "samesite" not in attrs:
                 insecure_cookies.append("missing SameSite")
 
         if insecure_cookies:
@@ -177,8 +181,6 @@ def run(ip, port, proto):
                     ),
                 )
             )
-
-        conn.close()
 
         return result(
             "http",
@@ -202,3 +204,8 @@ def run(ip, port, proto):
                 )
             ],
         )
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass

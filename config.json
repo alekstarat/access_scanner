@@ -1,0 +1,20 @@
+{
+  "paths": {
+    "wordlists_dir": "wordlists",
+    "ssh_password_wordlist": "wordlists/500p.txt",
+    "logs_dir": "logs",
+    "runtime_dir": "state",
+    "rc_dir": "rcs"
+  },
+  "binaries": {
+    "metasploit": "msfconsole",
+    "python": "python3",
+    "ffuf": "ffuf",
+    "nmap": "nmap"
+  },
+  "limits": {
+    "html_fetch_timeout": 12,
+    "html_min_body_size": 512,
+    "max_html_domains": 5
+  }
+}

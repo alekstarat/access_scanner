@@ -384,26 +384,78 @@ def _should_parse(ctx: dict) -> tuple[bool, str]:
     return True, f"content_type={ctype}, body_size={size}"
 
 
-def _build_url(ctx: dict) -> str:
-    ip = ctx.get("ip") or "127.0.0.1"
-    port = int(ctx.get("port") or 80)
+def _valid_host_candidate(value: Any) -> str | None:
+    """Normalize a certificate/DNS domain into a safe HTTP Host; reject wildcard SANs."""
+    import ipaddress
+    raw = str(value or "").strip()
+    if not raw or raw in {".", "localhost"} or "*" in raw:
+        return None
+    # Accept values accidentally stored as URLs, host:port, or comma/space-separated entries.
+    if "://" in raw:
+        raw = urlparse(raw).hostname or ""
+    else:
+        raw = raw.split("/", 1)[0].strip()
+        if raw.startswith("[") and "]" in raw:
+            raw = raw[1:raw.index("]")]
+        elif raw.count(":") == 1:
+            raw = raw.rsplit(":", 1)[0]
+    raw = raw.rstrip(".").strip().lower()
+    if not raw:
+        return None
+    try:
+        return str(ipaddress.ip_address(raw))
+    except ValueError:
+        pass
+    try:
+        ascii_host = raw.encode("idna").decode("ascii")
+    except (UnicodeError, ValueError):
+        return None
+    if len(ascii_host) > 253:
+        return None
+    labels = ascii_host.split(".")
+    if any(not label or len(label) > 63 or label.startswith("-") or label.endswith("-")
+           or not re.fullmatch(r"[a-z0-9-]+", label) for label in labels):
+        return None
+    return ascii_host
+
+
+def _build_urls(ctx: dict) -> list[str]:
+    ip = _valid_host_candidate(ctx.get("ip")) or "127.0.0.1"
+    try:
+        port = int(ctx.get("port") or 80)
+        if not 1 <= port <= 65535:
+            port = 80
+    except (TypeError, ValueError):
+        port = 80
     service = (ctx.get("service") or "").lower()
     tls = service == "https" or port in (443, 8443, 9443)
-
-    # предпочитаем известный домен
-    host = ip
-    domains = ctx.get("domains") or []
-    for d in domains:
-        name = d.get("name") if isinstance(d, dict) else str(d)
-        if name and name not in ("", ".", "localhost"):
-            host = name
-            break
-
     scheme = "https" if tls else "http"
     default_port = 443 if tls else 80
-    if port == default_port:
-        return f"{scheme}://{host}/"
-    return f"{scheme}://{host}:{port}/"
+
+    candidates = []
+    domains = ctx.get("domains") or []
+    if isinstance(domains, str):
+        domains = re.split(r"[,;\\s]+", domains)
+    for item in domains:
+        name = item.get("name") if isinstance(item, dict) else item
+        host = _valid_host_candidate(name)
+        if host and host not in candidates:
+            candidates.append(host)
+        if len(candidates) >= 5:
+            break
+    # If domain metadata is missing/invalid, use the observed IP instead of a wildcard.
+    if ip not in candidates:
+        candidates.append(ip)
+    urls = []
+    for host in candidates:
+        authority = host if port == default_port else f"{host}:{port}"
+        urls.append(f"{scheme}://{authority}/")
+    return urls
+
+
+def _build_url(ctx: dict) -> str:
+    """Backward-compatible single URL helper."""
+    return _build_urls(ctx)[0]
 
 
 def get_html(url: str, verify_tls: bool = False) -> tuple[str | None, dict]:
@@ -452,14 +504,28 @@ def run(ctx: dict) -> dict:
             "reason": reason,
         }
 
-    url = _build_url(ctx)
-    html, meta = get_html(url)
+    urls = _build_urls(ctx)
+    url = urls[0]
+    html = None
+    meta = {}
+    errors = []
+    # Try valid DNS names in order; wildcard certificate entries are ignored.
+    # The observed IP is appended as a fallback by _build_urls().
+    for candidate_url in urls:
+        candidate_html, candidate_meta = get_html(candidate_url)
+        if candidate_html is not None:
+            url, html, meta = candidate_url, candidate_html, candidate_meta
+            break
+        errors.append({"url": candidate_url, "error": candidate_meta.get("error", "fetch failed")})
+        meta = candidate_meta
 
     if html is None:
         return {
             "ok": False,
             "error": meta.get("error", "fetch failed"),
             "url": url,
+            "attempted_urls": urls,
+            "attempt_errors": errors,
             "meta": meta,
             "gate": reason,
         }

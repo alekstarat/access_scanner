@@ -1,7 +1,15 @@
 #!/bin/bash
 
-USERNAMES="/home/arch/Desktop/git/access_scanner/wordlists/usernames.txt"
-PASSWORDS="/home/arch/Desktop/git/access_scanner/wordlists/500p.txt"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 
-hydra -L "$USERNAMES" -P "$PASSWORDS" telnet://44.27.43.85
+USERNAMES="$PROJECT_ROOT/wordlists/usernames.txt"
+PASSWORDS="$PROJECT_ROOT/wordlists/500p.txt"
+TARGET="${1:-}"
 
+if [ -z "$TARGET" ]; then
+    echo "Usage: $0 <target>" >&2
+    exit 1
+fi
+
+hydra -L "$USERNAMES" -P "$PASSWORDS" "telnet://$TARGET"

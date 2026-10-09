@@ -1,10 +1,65 @@
+import contextlib
 import json
 import sqlite3
 from pathlib import Path
 from datetime import datetime, timezone
 
 
-DB_PATH = Path("data/recon.db")
+ROOT = Path(__file__).resolve().parent
+DB_PATH = ROOT / "data" / "recon.db"
+
+
+class _ClosingConnection(sqlite3.Connection):
+    """sqlite3.Connection, закрывающий файл при выходе из `with`.
+
+    Стандартный контекстный менеджер sqlite3 делает commit/rollback,
+    но НЕ закрывает соединение — отсюда утечки fd в worker/webapp.
+    """
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            return super().__exit__(exc_type, exc, tb)
+        finally:
+            try:
+                self.close()
+            except Exception:
+                pass
+
+
+def connect():
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(
+        str(DB_PATH), timeout=30.0, check_same_thread=False, factory=_ClosingConnection
+    )
+    conn.row_factory = sqlite3.Row
+    # Меньше SQLITE_BUSY при параллельных writer'ах (worker + deep + web).
+    try:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA busy_timeout=30000;")
+        conn.execute("PRAGMA foreign_keys=ON;")
+    except Exception:
+        pass
+    return conn
+
+
+@contextlib.contextmanager
+def transaction():
+    """Короткая транзакция с гарантированным close."""
+    conn = connect()
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 SCHEMA = """
@@ -79,7 +134,7 @@ CREATE TABLE IF NOT EXISTS geo (
 CREATE TABLE IF NOT EXISTS findings (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     host_id         INTEGER NOT NULL,
-    observation_id  INTEGER,
+    observation_id  INTEGER NOT NULL DEFAULT 0,
     finding_key     TEXT NOT NULL,
     severity        INTEGER NOT NULL,
     title           TEXT NOT NULL,
@@ -123,6 +178,15 @@ CREATE INDEX IF NOT EXISTS idx_obs_service ON service_observations(service);
 CREATE INDEX IF NOT EXISTS idx_domains_host ON domains(host_id);
 CREATE INDEX IF NOT EXISTS idx_findings_host ON findings(host_id);
 CREATE INDEX IF NOT EXISTS idx_deep_status ON deep_tasks(status);
+CREATE TABLE IF NOT EXISTS task_logs (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id     INTEGER NOT NULL,
+    stream      TEXT NOT NULL,
+    line        TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    FOREIGN KEY(task_id) REFERENCES deep_tasks(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_task_logs_task ON task_logs(task_id, id);
 """
 
 
@@ -130,20 +194,49 @@ def utcnow():
     return datetime.now(timezone.utc).isoformat()
 
 
-def connect(timeout: float = 30.0):
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, timeout=timeout, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA journal_mode = WAL")
-    conn.execute("PRAGMA busy_timeout = 30000")
-    conn.execute("PRAGMA synchronous = NORMAL")
-    return conn
-
-
 def init_db():
     with connect() as conn:
         conn.executescript(SCHEMA)
+        # Миграция старых БД: observation_id мог быть NULL ( UNIQUE с NULL
+        # не дедуплицирует в SQLite) — нормализуем к 0 и чистим дубли.
+        try:
+            cols = [r["name"] for r in conn.execute("PRAGMA table_info(findings)").fetchall()]
+            if "observation_id" in cols:
+                conn.execute("UPDATE findings SET observation_id = 0 WHERE observation_id IS NULL")
+                conn.execute(
+                    """
+                    DELETE FROM findings
+                    WHERE id NOT IN (
+                        SELECT MIN(id) FROM findings
+                        GROUP BY host_id, observation_id, finding_key
+                    )
+                    """
+                )
+        except Exception:
+            pass
+        # Backward-compatible migration for databases created before task leases/logs.
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(deep_tasks)").fetchall()}
+        migrations = {
+            "worker_id": "ALTER TABLE deep_tasks ADD COLUMN worker_id TEXT",
+            "heartbeat_at": "ALTER TABLE deep_tasks ADD COLUMN heartbeat_at TEXT",
+            "cancel_requested": "ALTER TABLE deep_tasks ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0",
+            "attempt": "ALTER TABLE deep_tasks ADD COLUMN attempt INTEGER NOT NULL DEFAULT 0",
+        }
+        for name, sql in migrations.items():
+            if name not in cols:
+                conn.execute(sql)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_deep_heartbeat ON deep_tasks(status, heartbeat_at)")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS task_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id INTEGER NOT NULL,
+                stream TEXT NOT NULL,
+                line TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(task_id) REFERENCES deep_tasks(id) ON DELETE CASCADE
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_task_logs_task ON task_logs(task_id, id)")
 
 
 # ── Hosts ──────────────────────────────────────────────
@@ -350,6 +443,11 @@ def upsert_geo(conn, host_id, geo_data, timestamp=None):
 # ── Findings ───────────────────────────────────────────
 
 def upsert_finding(conn, host_id, observation_id, item, timestamp=None):
+    # Host-level findings (reverse_dns, expired_cert) приходят с observation_id=None.
+    # В SQLite NULL != NULL, поэтому UNIQUE(host_id, observation_id, finding_key)
+    # с NULL никогда не дедуплицируется. Нормализуем к 0.
+    if observation_id is None:
+        observation_id = 0
     timestamp = timestamp or utcnow()
     finding_key = item.get("id") or item.get("finding_key") or "unknown"
 
@@ -407,23 +505,38 @@ def upsert_finding(conn, host_id, observation_id, item, timestamp=None):
 # ── Deep tasks ─────────────────────────────────────────
 
 def enqueue_deep(conn, observation_id, chain, priority=0):
-    # не дублируем pending/running
+    # не дублируем pending/running; done/error/cancelled пересоздаём,
+    # чтобы упавшая цепочка перезапустилась при повторном скане хоста.
     existing = conn.execute(
         """
-        SELECT id FROM deep_tasks
+        SELECT id, status FROM deep_tasks
         WHERE observation_id = ? AND chain = ?
-          AND status IN ('pending', 'running')
+        ORDER BY id DESC
         """,
         (observation_id, chain),
     ).fetchone()
-    if existing:
-        return existing["id"]
+    if existing is not None:
+        status = existing["status"] if hasattr(existing, "keys") else existing[1]
+        if status in ("pending", "running"):
+            return existing["id"] if hasattr(existing, "keys") else existing[0]
+        conn.execute(
+            """
+            UPDATE deep_tasks
+            SET status = 'pending', priority = ?, created_at = ?,
+                started_at = NULL, finished_at = NULL, error = NULL,
+                worker_id = NULL, heartbeat_at = NULL, cancel_requested = 0,
+                attempt = attempt + 1
+            WHERE id = ?
+            """,
+            (priority, utcnow(), existing["id"] if hasattr(existing, "keys") else existing[0]),
+        )
+        return existing["id"] if hasattr(existing, "keys") else existing[0]
 
     cur = conn.execute(
         """
         INSERT INTO deep_tasks (
-            observation_id, chain, status, priority, created_at
-        ) VALUES (?, ?, 'pending', ?, ?)
+            observation_id, chain, status, priority, created_at, attempt, cancel_requested
+        ) VALUES (?, ?, 'pending', ?, ?, 0, 0)
         """,
         (observation_id, chain, priority, utcnow()),
     )
@@ -434,7 +547,7 @@ def fetch_pending_deep(conn, limit=20):
     return conn.execute(
         """
         SELECT * FROM deep_tasks
-        WHERE status = 'pending'
+        WHERE status = 'pending' AND cancel_requested = 0
         ORDER BY priority DESC, id ASC
         LIMIT ?
         """,
@@ -442,23 +555,154 @@ def fetch_pending_deep(conn, limit=20):
     ).fetchall()
 
 
-def mark_deep_running(conn, task_id):
+def mark_deep_running(conn, task_id, worker_id):
+    cur = conn.execute(
+        """
+        UPDATE deep_tasks
+        SET status = 'running', started_at = ?, finished_at = NULL, error = NULL,
+            worker_id = ?, heartbeat_at = ?, cancel_requested = 0, attempt = attempt + 1
+        WHERE id = ? AND status = 'pending' AND cancel_requested = 0
+        """,
+        (utcnow(), worker_id, utcnow(), task_id),
+    )
+    return cur.rowcount == 1
+
+
+def heartbeat_deep(conn, task_id, worker_id):
     conn.execute(
-        "UPDATE deep_tasks SET status = 'running', started_at = ? WHERE id = ?",
-        (utcnow(), task_id),
+        """
+        UPDATE deep_tasks SET heartbeat_at = ?
+        WHERE id = ? AND status = 'running' AND worker_id = ?
+        """,
+        (utcnow(), task_id, worker_id),
     )
 
 
-def mark_deep_done(conn, task_id, error=None):
+def mark_deep_done(conn, task_id, error=None, expected_status=None):
+    """Помечает deep-задачу завершённой.
+
+    expected_status: если задан — UPDATE сработает только если задача всё ещё
+    в этом статусе. Защита от гонки «timeout записал error, а зависший тред
+    позже перезаписал его на done».
+    Возвращает True если строка обновлена.
+    """
     status = "error" if error else "done"
+    if expected_status is not None:
+        cur = conn.execute(
+            """
+            UPDATE deep_tasks
+            SET status = ?, finished_at = ?, error = ?, heartbeat_at = NULL, worker_id = NULL
+            WHERE id = ? AND status = ?
+            """,
+            (status, utcnow(), error, task_id, expected_status),
+        )
+        return cur.rowcount == 1
     conn.execute(
         """
         UPDATE deep_tasks
-        SET status = ?, finished_at = ?, error = ?
+        SET status = ?, finished_at = ?, error = ?, heartbeat_at = NULL, worker_id = NULL
         WHERE id = ?
         """,
         (status, utcnow(), error, task_id),
     )
+    return True
+
+
+def mark_deep_cancelled(conn, task_id, reason="cancelled by user"):
+    conn.execute(
+        """
+        UPDATE deep_tasks
+        SET status = 'cancelled', finished_at = ?, error = ?,
+            heartbeat_at = NULL, worker_id = NULL, cancel_requested = 0
+        WHERE id = ?
+        """,
+        (utcnow(), reason, task_id),
+    )
+
+
+def deep_cancel_requested(conn, task_id):
+    row = conn.execute("SELECT cancel_requested FROM deep_tasks WHERE id = ?", (task_id,)).fetchone()
+    return bool(row and row["cancel_requested"])
+
+
+def request_deep_cancel(conn, task_id):
+    cur = conn.execute(
+        """
+        UPDATE deep_tasks SET cancel_requested = 1
+        WHERE id = ? AND status = 'running'
+        """,
+        (task_id,),
+    )
+    if cur.rowcount:
+        return True
+    cur = conn.execute(
+        """
+        UPDATE deep_tasks
+        SET status = 'cancelled', finished_at = ?, error = 'cancelled by user'
+        WHERE id = ? AND status = 'pending'
+        """,
+        (utcnow(), task_id),
+    )
+    return cur.rowcount == 1
+
+
+def restart_deep(conn, task_id):
+    cur = conn.execute(
+        """
+        UPDATE deep_tasks
+        SET status = 'pending', started_at = NULL, finished_at = NULL, error = NULL,
+            worker_id = NULL, heartbeat_at = NULL, cancel_requested = 0
+        WHERE id = ? AND status IN ('done', 'error', 'cancelled')
+        """,
+        (task_id,),
+    )
+    return cur.rowcount == 1
+
+
+def recover_interrupted_deep(conn, stale_after_seconds=30):
+    # Перезапускаем только действительно потерянные leases. Это не ломает живой worker.
+    from datetime import timedelta
+    cutoff = (datetime.now(timezone.utc) - timedelta(seconds=stale_after_seconds)).isoformat()
+    rows = conn.execute(
+        """
+        SELECT id FROM deep_tasks
+        WHERE status = 'running'
+          AND COALESCE(heartbeat_at, started_at) < ?
+        """,
+        (cutoff,),
+    ).fetchall()
+    if rows:
+        ids = [r["id"] for r in rows]
+        conn.execute(
+            f"""
+            UPDATE deep_tasks
+            SET status = 'pending', started_at = NULL, finished_at = NULL,
+                error = 'worker interrupted; task requeued', worker_id = NULL,
+                heartbeat_at = NULL, cancel_requested = 0
+            WHERE id IN ({','.join('?' * len(ids))})
+            """,
+            ids,
+        )
+    return len(rows)
+
+
+def save_task_log(conn, task_id, stream, line):
+    conn.execute(
+        "INSERT INTO task_logs (task_id, stream, line, created_at) VALUES (?, ?, ?, ?)",
+        (task_id, stream, line, utcnow()),
+    )
+
+
+def fetch_task_logs(conn, task_id, limit=2000, after_id=0):
+    rows = conn.execute(
+        """
+        SELECT id, task_id, stream, line, created_at
+        FROM task_logs WHERE task_id = ? AND id > ?
+        ORDER BY id ASC LIMIT ?
+        """,
+        (task_id, after_id, limit),
+    ).fetchall()
+    return [dict(r) for r in rows]
 
 
 def save_deep_result(conn, task_id, observation_id, key, value):

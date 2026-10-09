@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+{% block title %}Dashboard · Access Scanner{% endblock %}
+{% block topbar %}<h1>Worker Dashboard</h1><div class="stats" id="live-clock"></div>{% endblock %}
+{% block content %}
+<div class="dashboard-grid">
+  <section class="dash-card">
+    <div class="dash-head"><h2>Worker</h2><span id="worker-state" class="status {% if status.running %}running{% else %}stopped{% endif %}">{% if status.running %}running{% else %}stopped{% endif %}</span></div>
+    <div class="metric-row"><span>PID</span><b id="worker-pid">{{ status.pid or '—' }}</b></div>
+    <div class="metric-row"><span>Worker ID</span><b id="worker-id" class="mono">{{ status.worker_id or '—' }}</b></div>
+    <div class="metric-row"><span>Deep slots</span><b id="slots">{{ status.deep.workers if status.deep else 0 }}</b></div>
+    <div class="metric-row"><span>Free slots</span><b id="free-slots">{{ status.free_slots }}</b></div>
+    <div class="dash-actions"><button id="worker-start">Start worker</button><button id="worker-stop" class="danger">Stop worker</button></div>
+  </section>
+  <section class="dash-card">
+    <div class="dash-head"><h2>Queue</h2><a href="{{ url_for('tasks_page') }}">Open tasks →</a></div>
+    <div class="big-metrics">
+      <div><b id="q-running">{{ tstats.running }}</b><span>running</span></div>
+      <div><b id="q-pending">{{ tstats.pending }}</b><span>pending</span></div>
+      <div><b id="q-done">{{ tstats.done }}</b><span>done</span></div>
+      <div><b id="q-error">{{ tstats.error }}</b><span>error</span></div>
+    </div>
+    <div class="metric-row"><span>Hosts</span><b>{{ host_count }}</b></div>
+    <div class="metric-row"><span>Scans</span><b>{{ scan_count }}</b></div>
+  </section>
+  <section class="dash-card dash-wide">
+    <div class="dash-head"><h2>Active subprocesses</h2><span class="muted">live</span></div>
+    <div class="table-wrap"><table class="hosts"><thead><tr><th>PID</th><th>Task</th><th>Command</th><th>Started</th></tr></thead><tbody id="processes"><tr><td colspan="4" class="empty">No active subprocesses</td></tr></tbody></table></div>
+  </section>
+  <section class="dash-card dash-wide">
+    <div class="dash-head"><h2>Worker stdout / stderr</h2><a href="{{ url_for('logs_page') }}">Task logs →</a></div>
+    <pre id="worker-log" class="live-log">{{ worker_log }}</pre>
+  </section>
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+const $=s=>document.querySelector(s);
+async function refresh(){
+  const r=await fetch('{{ url_for("api_worker") }}'); if(!r.ok)return; const d=await r.json();
+  $('#worker-state').textContent=d.running?'running':'stopped'; $('#worker-state').className='status '+(d.running?'running':'stopped');
+  $('#worker-pid').textContent=d.pid||'—'; $('#worker-id').textContent=d.worker_id||'—';
+  $('#slots').textContent=(d.deep||{}).workers||0; $('#free-slots').textContent=d.free_slots||0;
+  const q=d.queue||{}; ['running','pending','done','error'].forEach(k=>$('#q-'+k).textContent=q[k]||0);
+  const rows=((d.runtime||{}).processes||[]).map(p=>`<tr><td class="mono">${p.pid}</td><td>#${p.task_id||'—'}</td><td class="mono">${escapeHtml(p.command||'')}</td><td class="mono muted">${p.started_at||'—'}</td></tr>`).join('');
+  $('#processes').innerHTML=rows||'<tr><td colspan="4" class="empty">No active subprocesses</td></tr>';
+  const lr=await fetch('{{ url_for("api_worker_log") }}'); if(lr.ok){const ld=await lr.json(); const el=$('#worker-log'); const stick=el.scrollTop+el.clientHeight>=el.scrollHeight-40; el.textContent=ld.text||''; if(stick)el.scrollTop=el.scrollHeight;}
+}
+function escapeHtml(s){return s.replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+async function workerAction(a){const r=await fetch('/api/worker/'+a,{method:'POST'}); const d=await r.json(); if(!r.ok)alert(d.message||d.error||'Request failed'); refresh();}
+$('#worker-start').onclick=()=>workerAction('start'); $('#worker-stop').onclick=()=>workerAction('stop');
+refresh(); setInterval(refresh,1500);
+</script>
+{% endblock %}

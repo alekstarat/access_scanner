@@ -647,3 +647,34 @@ footer {
   font-size: 12px;
   text-align: center;
 }
+
+
+/* Task control */
+.actions button, .actions .tag {
+  display:inline-block; margin-left:4px; padding:3px 7px; border:1px solid var(--border);
+  border-radius:4px; background:transparent; color:var(--muted); cursor:pointer; text-decoration:none; font-size:11px;
+}
+.actions button:hover, .actions .tag:hover { color:var(--text); border-color:var(--accent2); }
+.task-row.status-running { background:rgba(42,74,106,.10); }
+
+/* Dashboard */
+.sidebar-links { display:flex; gap:10px; margin-top:10px; flex-wrap:wrap; text-transform:none; letter-spacing:0; }
+.sidebar-links a { color:var(--muted); font-size:11px; }
+.sidebar-links a:hover { color:var(--text); }
+.dashboard-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:16px; }
+.dash-card { background:var(--bg2); border:1px solid var(--border); border-radius:var(--radius); padding:18px; min-width:0; }
+.dash-wide { grid-column:1/-1; }
+.dash-head { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:16px; }
+.dash-head h2 { font-size:14px; font-weight:600; }
+.metric-row { display:flex; justify-content:space-between; gap:20px; padding:8px 0; border-bottom:1px solid var(--border); color:var(--muted); }
+.metric-row:last-child { border-bottom:0; }
+.metric-row b { color:var(--text); }
+.big-metrics { display:grid; grid-template-columns:repeat(4,1fr); gap:10px; margin-bottom:16px; }
+.big-metrics div { background:var(--bg3); border:1px solid var(--border); border-radius:8px; padding:12px; }
+.big-metrics b { display:block; font:700 24px var(--font); }
+.big-metrics span { color:var(--muted); font-size:11px; }
+.dash-actions { display:flex; gap:8px; margin-top:16px; }
+.dash-actions button { border:0; border-radius:8px; padding:8px 14px; background:var(--accent); color:#fff; cursor:pointer; }
+.dash-actions button.danger { background:var(--high); }
+.live-log { height:360px; overflow:auto; background:#0b0e12; border:1px solid var(--border); border-radius:8px; padding:14px; font:12px/1.5 var(--font); white-space:pre-wrap; }
+@media(max-width:900px){.dashboard-grid{grid-template-columns:1fr}.dash-wide{grid-column:auto}.big-metrics{grid-template-columns:repeat(2,1fr)}}

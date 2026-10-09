@@ -15,8 +15,13 @@ def run(ip, port, proto):
 
     try:
         with socket.create_connection((ip, port), timeout=3) as sock:
-            sock.sendall(b"SSH-2.0-port-hub\r\n")
-            raw = sock.recv(256)
+            sock.settimeout(3)
+            # Сначала читаем баннер сервера: отправка своей версии до чтения
+            # заставляет часть серверов рвать соединение.
+            try:
+                raw = sock.recv(256)
+            except socket.timeout:
+                raw = b""
 
         banner = raw.decode(errors="replace").strip()
 
